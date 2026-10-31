@@ -1,0 +1,6 @@
+/temporaless
+/temporaless.db
+/temporaless.db-shm
+/temporaless.db-wal
+/.metrics/
+/target/
