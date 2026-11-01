@@ -139,9 +139,12 @@ go run ./cmd/temporaless -config temporaless.example.yaml
 ```bash
 go test ./...
 TEMPORAL_SMOKE=1 go test ./...
+TEMPORALESS_STRESS=1 go test -run '^TestSustainedControlPlaneStress$' -timeout 1m ./internal/control
 ```
 
 第二条命令需要 `localhost:7233` 上运行 Temporal，覆盖 Worker Deployment backlog、并发 in-flight Activity 排空、heartbeat 取消传播以及完整的 r1 → r2 → tombstone 调用链。
+
+第三条命令运行 30 秒可选压力测试，不连接 Temporal；它持续并发执行 REST PUT/DELETE/GET/LIST/healthz，并校验 SQLite revision、runtime current 和存活 Worker 最终一致。默认 `go test ./...` 会跳过它。
 
 ## 文档
 

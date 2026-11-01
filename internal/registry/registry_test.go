@@ -230,6 +230,74 @@ func TestConcurrentListReturnsConsistentJoinedRevisionSnapshots(t *testing.T) {
 	}
 }
 
+func TestConcurrentGetReturnsConsistentJoinedRevisionSnapshots(t *testing.T) {
+	t.Parallel()
+
+	store := openTestRegistry(t)
+	ctx := context.Background()
+	first, _, err := store.Prepare(ctx, "service-a", KindService, []byte(`{"v":1}`), "hash-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Activate(ctx, "service-a", first.Number); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	errorsFound := make(chan error, 1)
+	report := func(err error) {
+		select {
+		case errorsFound <- err:
+		default:
+		}
+	}
+	var readers sync.WaitGroup
+	readers.Add(4)
+	for range 4 {
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				service, err := store.Get(ctx, "service-a")
+				if err != nil {
+					report(err)
+					return
+				}
+				if service.CurrentRevision != service.Current.Number || service.Current.State != RevisionActive || service.State != ServiceActive || service.Latest.Number < service.CurrentRevision {
+					report(fmt.Errorf("inconsistent joined Get snapshot: %#v", service))
+					return
+				}
+			}
+		}()
+	}
+
+	var writerErr error
+	for revision := 2; revision <= 200; revision++ {
+		prepared, _, err := store.Prepare(ctx, "service-a", KindService, []byte(fmt.Sprintf(`{"v":%d}`, revision)), fmt.Sprintf("hash-%d", revision))
+		if err == nil {
+			err = store.Activate(ctx, "service-a", prepared.Number)
+		}
+		if err != nil {
+			writerErr = err
+			break
+		}
+	}
+	close(done)
+	readers.Wait()
+	if writerErr != nil {
+		t.Fatal(writerErr)
+	}
+	select {
+	case err := <-errorsFound:
+		t.Fatal(err)
+	default:
+	}
+}
+
 func TestTombstoneMissingService(t *testing.T) {
 	t.Parallel()
 
