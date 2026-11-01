@@ -31,6 +31,15 @@ func TestHeartbeatInterval(t *testing.T) {
 	}
 }
 
+func TestTemporalRuntimeDefaultsActivityConcurrency(t *testing.T) {
+	t.Parallel()
+
+	runtime := NewTemporalRuntime(nil, 0, 0)
+	if got := runtime.maxConcurrentActivities; got != defaultMaxConcurrentActivities {
+		t.Fatalf("max concurrent Activities = %d, want %d", got, defaultMaxConcurrentActivities)
+	}
+}
+
 func TestCurrentBuildID(t *testing.T) {
 	t.Parallel()
 

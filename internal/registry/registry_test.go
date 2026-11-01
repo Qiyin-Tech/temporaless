@@ -103,6 +103,48 @@ func TestFailedRevisionDoesNotReplaceCurrent(t *testing.T) {
 	}
 }
 
+func TestListJoinsCurrentAndLatestRevisions(t *testing.T) {
+	t.Parallel()
+
+	store := openTestRegistry(t)
+	ctx := context.Background()
+	current, _, err := store.Prepare(ctx, "service-a", KindService, []byte(`{"v":1}`), "hash-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Activate(ctx, "service-a", current.Number); err != nil {
+		t.Fatal(err)
+	}
+	latest, _, err := store.Prepare(ctx, "service-a", KindService, []byte(`{"v":2}`), "hash-a2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFailed(ctx, "service-a", latest.Number); err != nil {
+		t.Fatal(err)
+	}
+	failed, _, err := store.Prepare(ctx, "service-b", KindService, []byte(`{"v":1}`), "hash-b1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFailed(ctx, "service-b", failed.Number); err != nil {
+		t.Fatal(err)
+	}
+
+	services, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(services) != 2 {
+		t.Fatalf("services = %#v", services)
+	}
+	if service := services[0]; service.ID != "service-a" || service.Current.Number != 1 || service.Current.Hash != "hash-a1" || service.Latest.Number != 2 || service.Latest.Hash != "hash-a2" {
+		t.Fatalf("service-a = %#v", service)
+	}
+	if service := services[1]; service.ID != "service-b" || service.CurrentRevision != 0 || service.Latest.Number != 1 || service.Latest.State != RevisionFailed {
+		t.Fatalf("service-b = %#v", service)
+	}
+}
+
 func TestTombstoneMissingService(t *testing.T) {
 	t.Parallel()
 

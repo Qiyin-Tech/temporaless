@@ -157,6 +157,70 @@ func TestManagerConcurrentMutationsRemainLinearizable(t *testing.T) {
 	})
 }
 
+func TestManagerRejectsCanceledMutationAfterWaitingForLock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		prepare   func(*testing.T, *Manager)
+		mutate    func(context.Context, *Manager) error
+		assertion func(*testing.T, *registry.Registry)
+	}{
+		{
+			name:    "put",
+			prepare: func(*testing.T, *Manager) {},
+			mutate: func(ctx context.Context, manager *Manager) error {
+				_, err := manager.Put(ctx, "service-a", serviceSpec("https://example.com/v1"))
+				return err
+			},
+			assertion: func(t *testing.T, store *registry.Registry) {
+				if _, err := store.Get(context.Background(), "service-a"); !errors.Is(err, registry.ErrNotFound) {
+					t.Fatalf("stored service error = %v, want ErrNotFound", err)
+				}
+			},
+		},
+		{
+			name: "delete",
+			prepare: func(t *testing.T, manager *Manager) {
+				if _, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com/v1")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			mutate: func(ctx context.Context, manager *Manager) error {
+				_, err := manager.Delete(ctx, "service-a")
+				return err
+			},
+			assertion: func(t *testing.T, store *registry.Registry) {
+				service := getStoredService(t, store, "service-a")
+				if service.CurrentRevision != 1 || service.State != registry.ServiceActive {
+					t.Fatalf("service after canceled delete = %#v", service)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openRegistry(t)
+			manager := NewManager(store, &fakeRuntime{activities: make(map[string]Activity)}, http.DefaultClient, ManagerOptions{SwitchTimeout: time.Second})
+			t.Cleanup(manager.Close)
+			test.prepare(t, manager)
+
+			manager.opMu.Lock()
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- test.mutate(ctx, manager) }()
+			cancel()
+			manager.opMu.Unlock()
+
+			if err := <-result; !errors.Is(err, context.Canceled) {
+				t.Fatalf("mutation error = %v, want context canceled", err)
+			}
+			test.assertion(t, store)
+		})
+	}
+}
+
 func TestManagerStartFailureLeavesCurrentRevision(t *testing.T) {
 	t.Parallel()
 
@@ -185,7 +249,7 @@ func TestManagerReconcilesPersistedStartingRevision(t *testing.T) {
 	t.Parallel()
 
 	store := openRegistry(t)
-	compiled, err := backend.Compile(serviceSpec("https://example.com/v1"), http.DefaultClient)
+	compiled, err := backend.Compile(serviceSpec("https://example.com/v1"), http.DefaultClient, backend.DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +320,7 @@ func TestManagerReconcilePreservesSafeRouting(t *testing.T) {
 
 	t.Run("initial unknown switch remains unresolved", func(t *testing.T) {
 		store := openRegistry(t)
-		compiled, err := backend.Compile(serviceSpec("https://example.com/v1"), http.DefaultClient)
+		compiled, err := backend.Compile(serviceSpec("https://example.com/v1"), http.DefaultClient, backend.DefaultMaxResponseBodyBytes)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -648,7 +712,7 @@ func activeServiceWithStartingUpdate(t *testing.T) *registry.Registry {
 	}
 	manager.Close()
 
-	compiled, err := backend.Compile(serviceSpec("https://example.com/v2"), http.DefaultClient)
+	compiled, err := backend.Compile(serviceSpec("https://example.com/v2"), http.DefaultClient, backend.DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}

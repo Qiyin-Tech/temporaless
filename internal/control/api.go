@@ -30,6 +30,7 @@ func NewAPI(manager *Manager, logger *slog.Logger) http.Handler {
 	api := &API{manager: manager, logger: logger, mux: http.NewServeMux()}
 	api.mux.HandleFunc("PUT /services/{id}", api.putService)
 	api.mux.HandleFunc("GET /services", api.listServices)
+	api.mux.HandleFunc("GET /services/{id}/health", api.getServiceHealth)
 	api.mux.HandleFunc("GET /services/{id}", api.getService)
 	api.mux.HandleFunc("DELETE /services/{id}", api.deleteService)
 	api.mux.HandleFunc("GET /healthz", api.health)
@@ -74,6 +75,28 @@ func (a *API) getService(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 	writeJSON(response, http.StatusOK, service)
+}
+
+func (a *API) getServiceHealth(response http.ResponseWriter, request *http.Request) {
+	health, err := a.manager.ServiceHealth(request.Context(), request.PathValue("id"))
+	if err != nil {
+		a.handleError(response, request, err)
+		return
+	}
+	a.logger.InfoContext(request.Context(), "service health checked",
+		"service_id", health.ID,
+		"revision", health.Revision,
+		"registry_state", health.RegistryState,
+		"health", health.Health,
+		"http_status", health.HTTPStatus,
+		"latency_ms", health.LatencyMS,
+		"message", health.Message,
+	)
+	status := http.StatusOK
+	if health.Health == "unhealthy" || health.Health == "not_ready" {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(response, status, health)
 }
 
 func (a *API) deleteService(response http.ResponseWriter, request *http.Request) {

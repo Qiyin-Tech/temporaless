@@ -69,11 +69,18 @@ Serverless Workers 强制使用 Worker Deployment Versioning，其中可复用�
       "endpoint": "https://example.com/status/{job_id}"
     }
   },
+  "health": {
+    "method": "GET",
+    "endpoint": "https://example.com/health",
+    "timeout": "3s"
+  },
   "timeout": "5m"
 }
 ```
 
 `invoke`、`submit`、`status`、`cancel` 只是普通 action 名称，不带 provider 语义。每个 action 独立配置 method、endpoint 和 schema；`response_schemas` 按十进制 HTTP status 精确匹配。需要异步任务 ID 的 endpoint 只允许使用 `{job_id}` 占位符，替换时按单个 URL path segment 转义。未配置的 action 直接返回 non-retryable `ActionNotFound`。
+
+`health` 是独立于业务 Activity 的可选 HTTP 探针，配置 method、endpoint 和独立 timeout，不允许 `{job_id}`。`GET /services/{id}/health` 直接从 Gateway 请求后端，任意 2xx 表示 healthy；未配置时返回 `not_configured`，非 2xx、网络错误或超时返回 unhealthy。结果不写入 SQLite，响应和结构化日志记录 HTTP status 与 latency，供外部可观测系统查询。该接口不查询 Temporal poller，Worker/Temporal 可用性属于 Gateway 基础设施健康。
 
 ### 4. payload 保持 HTTP 对象语义透明
 
@@ -181,7 +188,7 @@ SQLite Registry ◄──► Reconciler / Worker Manager
 - 管理 API 可以注册任意 endpoint，等同于受控 SSRF/出网能力。首版本地默认只监听 loopback；生产部署前必须增加管理面鉴权和网络层 endpoint/egress 约束。
 - 透传的鉴权 header 和 body 会进入 Temporal Event History。真实凭据投入生产前必须配置 Payload Codec 加密，或改为传 secret reference；日志不得输出 header/body。
 - HTTP Activity 不能在一次请求中可靠 checkpoint。长请求必须设置合理的 Start-To-Close Timeout，并依赖后端幂等键承受 Temporal retry。
-- HTTP response 当前必须完整读入内存后才能成为 Temporal payload，Gateway 尚未配置独立大小上限；后端或出网代理必须限制响应体，避免在 Temporal payload 限制生效前造成进程内存压力。
+- HTTP response 必须完整读入内存后才能成为 Temporal payload，因此 Gateway 默认将响应体限制为 1 MiB，并允许通过进程启动参数调整；更大的结果优先改传对象存储引用。
 - 当前本地 Temporal 使用 in-memory persistence；Temporal Server 重启会丢失 History、Task 和 Worker Deployment 状态。SQLite 只能恢复服务配置，不能恢复这些 Temporal 数据。
 
 ## 被否决的方案

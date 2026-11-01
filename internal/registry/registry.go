@@ -346,35 +346,108 @@ func (r *Registry) loadServiceRevisions(ctx context.Context, service *Service, c
 }
 
 func (r *Registry) List(ctx context.Context) ([]Service, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id FROM services ORDER BY id`)
+	rows, err := r.db.QueryContext(ctx, `
+		WITH latest_revisions AS (
+			SELECT service_id, MAX(revision) AS revision
+			FROM service_revisions
+			GROUP BY service_id
+		)
+		SELECT
+			s.id, s.state, s.current_revision, s.created_at, s.updated_at,
+			current.revision, current.kind, current.state, current.switch_started,
+			current.spec_json, current.config_hash, current.created_at, current.updated_at,
+			latest.revision, latest.kind, latest.state, latest.switch_started,
+			latest.spec_json, latest.config_hash, latest.created_at, latest.updated_at
+		FROM services AS s
+		LEFT JOIN service_revisions AS current
+			ON current.service_id = s.id AND current.revision = s.current_revision
+		LEFT JOIN latest_revisions
+			ON latest_revisions.service_id = s.id
+		LEFT JOIN service_revisions AS latest
+			ON latest.service_id = latest_revisions.service_id
+			AND latest.revision = latest_revisions.revision
+		ORDER BY s.id`)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
+	defer rows.Close()
+
+	var services []Service
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
+		var service Service
+		var currentNumber sql.NullInt64
+		var serviceCreatedAt, serviceUpdatedAt string
+		var current, latest joinedRevision
+		if err := rows.Scan(
+			&service.ID, &service.State, &currentNumber, &serviceCreatedAt, &serviceUpdatedAt,
+			&current.number, &current.kind, &current.state, &current.switchStarted,
+			&current.specJSON, &current.hash, &current.createdAt, &current.updatedAt,
+			&latest.number, &latest.kind, &latest.state, &latest.switchStarted,
+			&latest.specJSON, &latest.hash, &latest.createdAt, &latest.updatedAt,
+		); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	services := make([]Service, 0, len(ids))
-	for _, id := range ids {
-		service, err := r.Get(ctx, id)
+		var err error
+		service.CreatedAt, err = parseTime(serviceCreatedAt)
 		if err != nil {
 			return nil, err
 		}
+		service.UpdatedAt, err = parseTime(serviceUpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		if currentNumber.Valid {
+			service.CurrentRevision = currentNumber.Int64
+			service.Current, err = current.revision(service.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if latest.number.Valid {
+			service.Latest, err = latest.revision(service.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
 		services = append(services, service)
 	}
-	return services, nil
+	return services, rows.Err()
+}
+
+type joinedRevision struct {
+	number        sql.NullInt64
+	kind          sql.NullString
+	state         sql.NullString
+	switchStarted sql.NullInt64
+	specJSON      []byte
+	hash          sql.NullString
+	createdAt     sql.NullString
+	updatedAt     sql.NullString
+}
+
+func (r joinedRevision) revision(serviceID string) (Revision, error) {
+	if !r.number.Valid {
+		return Revision{}, ErrNotFound
+	}
+	createdAt, err := parseTime(r.createdAt.String)
+	if err != nil {
+		return Revision{}, err
+	}
+	updatedAt, err := parseTime(r.updatedAt.String)
+	if err != nil {
+		return Revision{}, err
+	}
+	return Revision{
+		ServiceID:     serviceID,
+		Number:        r.number.Int64,
+		Kind:          RevisionKind(r.kind.String),
+		State:         RevisionState(r.state.String),
+		SwitchStarted: r.switchStarted.Int64 != 0,
+		SpecJSON:      r.specJSON,
+		Hash:          r.hash.String,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+	}, nil
 }
 
 func (r *Registry) ListStarting(ctx context.Context) ([]Revision, error) {

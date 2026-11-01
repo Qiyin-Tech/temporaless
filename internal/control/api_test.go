@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -40,6 +41,12 @@ func TestAPIServiceLifecycle(t *testing.T) {
 	get := request(t, handler, http.MethodGet, "/services/image-generate", "")
 	if get.Code != http.StatusOK {
 		t.Fatalf("GET status = %d body=%s", get.Code, get.Body.String())
+	}
+	health := request(t, handler, http.MethodGet, "/services/image-generate/health", "")
+	var healthView ServiceHealthView
+	decodeResponse(t, health, &healthView)
+	if health.Code != http.StatusOK || healthView.Health != "not_configured" {
+		t.Fatalf("health without config = %d %#v", health.Code, healthView)
 	}
 
 	list := request(t, handler, http.MethodGet, "/services", "")
@@ -170,6 +177,59 @@ func TestAPIHealth(t *testing.T) {
 	response := request(t, handler, http.MethodGet, "/healthz", "")
 	if response.Code != http.StatusOK || response.Body.String() != "{\"status\":\"ok\"}\n" {
 		t.Fatalf("health = %d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestAPIServiceHealth(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		backend    int
+		wantStatus int
+		wantHealth string
+	}{
+		{name: "healthy", backend: http.StatusNoContent, wantStatus: http.StatusOK, wantHealth: "healthy"},
+		{name: "unhealthy", backend: http.StatusTeapot, wantStatus: http.StatusServiceUnavailable, wantHealth: "unhealthy"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var method string
+			backendServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				method = request.Method
+				response.WriteHeader(test.backend)
+			}))
+			defer backendServer.Close()
+
+			store := openRegistry(t)
+			manager := NewManager(store, &fakeRuntime{activities: make(map[string]Activity)}, backendServer.Client(), ManagerOptions{})
+			t.Cleanup(manager.Close)
+			var logs bytes.Buffer
+			handler := NewAPI(manager, slog.New(slog.NewTextHandler(&logs, nil)))
+			put := request(t, handler, http.MethodPut, "/services/service-a", fmt.Sprintf(`{
+				"actions":{"invoke":{"method":"POST","endpoint":"https://example.com"}},
+				"health":{"method":"post","endpoint":%q,"timeout":"2s"},
+				"timeout":"5s"
+			}`, backendServer.URL))
+			if put.Code != http.StatusOK {
+				t.Fatalf("PUT status = %d body=%s", put.Code, put.Body.String())
+			}
+
+			response := request(t, handler, http.MethodGet, "/services/service-a/health", "")
+			if response.Code != test.wantStatus {
+				t.Fatalf("health status = %d, want %d: %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			var health ServiceHealthView
+			decodeResponse(t, response, &health)
+			if health.Health != test.wantHealth || health.HTTPStatus != test.backend || health.LatencyMS <= 0 {
+				t.Fatalf("health = %#v", health)
+			}
+			if method != http.MethodPost {
+				t.Fatalf("health method = %q, want POST", method)
+			}
+			if !strings.Contains(logs.String(), "latency_ms=") {
+				t.Fatalf("health log missing latency: %s", logs.String())
+			}
+		})
 	}
 }
 

@@ -11,7 +11,11 @@ go run ./cmd/temporaless \
   -listen 127.0.0.1:8080 \
   -db temporaless.db \
   -temporal-address localhost:7233 \
-  -temporal-namespace default
+  -temporal-namespace default \
+  -max-concurrent-activities-per-service 32 \
+  -max-backend-response-bytes 1048576 \
+  -control-read-timeout 15s \
+  -max-idle-connections-per-host 32
 ```
 
 默认只监听 loopback。生产使用前需要为管理 API 增加鉴权，并处理 Temporal History 中 payload 的加密或 secret reference。
@@ -38,6 +42,11 @@ curl -X PUT http://127.0.0.1:8080/services/runpod-image \
         "endpoint": "https://example.com/jobs/{job_id}"
       }
     },
+    "health": {
+      "method": "GET",
+      "endpoint": "https://example.com/health",
+      "timeout": "3s"
+    },
     "timeout": "5m"
   }'
 ```
@@ -49,6 +58,7 @@ curl -X PUT http://127.0.0.1:8080/services/runpod-image \
 - `PUT /services/{id}`：新增、恢复或更新服务。
 - `GET /services`：列出服务。
 - `GET /services/{id}`：读取服务及 revision 状态。
+- `GET /services/{id}/health`：执行可选的后端健康探针；任意 2xx 表示 healthy，响应和结构化日志都包含 latency。
 - `DELETE /services/{id}`：切换到返回 `ServiceDeleted` 的 tombstone revision。
 - `GET /healthz`：检查 SQLite 与 Temporal。
 
@@ -75,6 +85,13 @@ temporaless.Request{
 响应使用 Go `net/http` 暴露的 status、header 和 body 构造 `temporaless.Response`。Gateway 不解析或重组业务对象；4xx/5xx 是正常 Activity 结果，网络错误、连接错误和超时才是 Activity failure。配置 schema 时，仅对 JSON body 的副本做校验。这里承诺的是 HTTP 对象语义透明，不是 wire bytes 透明：redirect、gzip 解压和 framing 等仍按 `net/http` 标准行为处理。
 
 Gateway 会在持续执行的 HTTP Activity 中发送空 heartbeat，使 Workflow cancellation 能取消 Activity context 和正在进行的 HTTP request。调用 Workflow 应按期望的取消延迟设置 `HeartbeatTimeout`；只有需要等待 HTTP 调用实际退出时才设置 `WaitForCancellation: true`，默认值 `false` 只发出取消请求而不等待确认。
+
+后端响应体默认上限为 1 MiB；更大的结果应返回对象存储引用，也可通过启动参数调整。每个服务默认最多并发执行 32 个 Activity。
+
+## Limitations
+
+- 管理 API 没有内建鉴权，并允许注册任意 HTTP/HTTPS endpoint，因此生产环境必须在入口增加鉴权，并通过网络策略限制 endpoint 和 egress；默认 loopback 监听只适合本地使用。
+- Activity 的 header、请求体和响应体都会进入 Temporal Event History。生产凭据和敏感数据必须使用 Payload Codec 加密，或改传 secret reference。
 
 ## 验证
 

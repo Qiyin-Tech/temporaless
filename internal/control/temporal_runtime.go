@@ -11,24 +11,36 @@ import (
 	"go.temporal.io/sdk/worker"
 )
 
-const activityHeartbeatInterval = time.Second
+const (
+	activityHeartbeatInterval      = time.Second
+	defaultMaxConcurrentActivities = 32
+)
 
 type TemporalRuntime struct {
-	client      client.Client
-	stopTimeout time.Duration
+	client                  client.Client
+	stopTimeout             time.Duration
+	maxConcurrentActivities int
 }
 
-func NewTemporalRuntime(temporalClient client.Client, stopTimeout time.Duration) *TemporalRuntime {
+func NewTemporalRuntime(temporalClient client.Client, stopTimeout time.Duration, maxConcurrentActivities int) *TemporalRuntime {
 	if stopTimeout <= 0 {
 		stopTimeout = 30 * time.Second
 	}
-	return &TemporalRuntime{client: temporalClient, stopTimeout: stopTimeout}
+	if maxConcurrentActivities <= 0 {
+		maxConcurrentActivities = defaultMaxConcurrentActivities
+	}
+	return &TemporalRuntime{
+		client:                  temporalClient,
+		stopTimeout:             stopTimeout,
+		maxConcurrentActivities: maxConcurrentActivities,
+	}
 }
 
 func (r *TemporalRuntime) Start(serviceID string, buildID string, activityFn Activity) (Worker, error) {
 	activityWorker := worker.New(r.client, serviceID, worker.Options{
-		DisableWorkflowWorker: true,
-		WorkerStopTimeout:     r.stopTimeout,
+		DisableWorkflowWorker:              true,
+		WorkerStopTimeout:                  r.stopTimeout,
+		MaxConcurrentActivityExecutionSize: r.maxConcurrentActivities,
 		DeploymentOptions: worker.DeploymentOptions{
 			UseVersioning: true,
 			Version: worker.WorkerDeploymentVersion{

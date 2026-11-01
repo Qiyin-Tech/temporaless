@@ -37,8 +37,9 @@ type Runtime interface {
 }
 
 type ManagerOptions struct {
-	SwitchTimeout time.Duration
-	RetryInterval time.Duration
+	SwitchTimeout               time.Duration
+	RetryInterval               time.Duration
+	MaxBackendResponseBodyBytes int64
 }
 
 type ServiceView struct {
@@ -52,6 +53,17 @@ type ServiceView struct {
 	Spec                *temporaless.ServiceSpec `json:"spec,omitempty"`
 	CreatedAt           time.Time                `json:"created_at"`
 	UpdatedAt           time.Time                `json:"updated_at"`
+}
+
+type ServiceHealthView struct {
+	ID            string                `json:"service_id"`
+	Revision      int64                 `json:"revision,omitempty"`
+	RegistryState registry.ServiceState `json:"registry_state"`
+	Health        string                `json:"health"`
+	HTTPStatus    int                   `json:"http_status,omitempty"`
+	LatencyMS     float64               `json:"latency_ms,omitempty"`
+	Message       string                `json:"message,omitempty"`
+	CheckedAt     time.Time             `json:"checked_at"`
 }
 
 type workerKey struct {
@@ -81,6 +93,9 @@ func NewManager(store *registry.Registry, runtime Runtime, client *http.Client, 
 	if options.RetryInterval <= 0 {
 		options.RetryInterval = 100 * time.Millisecond
 	}
+	if options.MaxBackendResponseBodyBytes <= 0 {
+		options.MaxBackendResponseBodyBytes = backend.DefaultMaxResponseBodyBytes
+	}
 	return &Manager{
 		registry:  store,
 		runtime:   runtime,
@@ -95,13 +110,16 @@ func (m *Manager) Put(ctx context.Context, serviceID string, spec temporaless.Se
 	if err := validateServiceID(serviceID); err != nil {
 		return ServiceView{}, err
 	}
-	compiled, err := backend.Compile(spec, m.client)
+	compiled, err := backend.Compile(spec, m.client, m.options.MaxBackendResponseBodyBytes)
 	if err != nil {
 		return ServiceView{}, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return ServiceView{}, err
+	}
 	if m.closed {
 		return ServiceView{}, errors.New("manager is closed")
 	}
@@ -128,6 +146,9 @@ func (m *Manager) Delete(ctx context.Context, serviceID string) (ServiceView, er
 	}
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return ServiceView{}, err
+	}
 	if m.closed {
 		return ServiceView{}, errors.New("manager is closed")
 	}
@@ -169,6 +190,55 @@ func (m *Manager) List(ctx context.Context) ([]ServiceView, error) {
 		views = append(views, view)
 	}
 	return views, nil
+}
+
+func (m *Manager) ServiceHealth(ctx context.Context, serviceID string) (ServiceHealthView, error) {
+	if err := validateServiceID(serviceID); err != nil {
+		return ServiceHealthView{}, err
+	}
+	service, err := m.registry.Get(ctx, serviceID)
+	if err != nil {
+		return ServiceHealthView{}, err
+	}
+	view := ServiceHealthView{
+		ID:            service.ID,
+		Revision:      service.CurrentRevision,
+		RegistryState: service.State,
+		CheckedAt:     time.Now().UTC(),
+	}
+	if service.State != registry.ServiceActive || service.Current.Kind != registry.KindService {
+		view.Health = "not_ready"
+		view.Message = fmt.Sprintf("service state is %s", service.State)
+		return view, nil
+	}
+	var spec temporaless.ServiceSpec
+	if err := json.Unmarshal(service.Current.SpecJSON, &spec); err != nil {
+		return ServiceHealthView{}, fmt.Errorf("decode stored spec: %w", err)
+	}
+	if spec.Health == nil {
+		view.Health = "not_configured"
+		return view, nil
+	}
+	probe, err := backend.NewHealthProbe(*spec.Health, m.client)
+	if err != nil {
+		return ServiceHealthView{}, fmt.Errorf("compile stored health spec: %w", err)
+	}
+	result, probeErr := probe.Check(ctx)
+	view.CheckedAt = time.Now().UTC()
+	view.HTTPStatus = result.Status
+	view.LatencyMS = float64(result.Latency) / float64(time.Millisecond)
+	if probeErr != nil {
+		view.Health = "unhealthy"
+		view.Message = probeErr.Error()
+		return view, nil
+	}
+	view.Message = result.Message
+	if result.Status >= http.StatusOK && result.Status < http.StatusMultipleChoices {
+		view.Health = "healthy"
+	} else {
+		view.Health = "unhealthy"
+	}
+	return view, nil
 }
 
 func (m *Manager) Reconcile(ctx context.Context) error {
@@ -494,7 +564,7 @@ func (m *Manager) activityFor(revision registry.Revision) (Activity, error) {
 	if err := json.Unmarshal(revision.SpecJSON, &spec); err != nil {
 		return nil, fmt.Errorf("decode stored spec: %w", err)
 	}
-	compiled, err := backend.Compile(spec, m.client)
+	compiled, err := backend.Compile(spec, m.client, m.options.MaxBackendResponseBodyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("compile stored spec: %w", err)
 	}

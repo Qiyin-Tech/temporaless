@@ -8,7 +8,14 @@ import (
 // ServiceSpec is the immutable HTTP configuration captured by one Worker revision.
 type ServiceSpec struct {
 	Actions map[string]ActionSpec `json:"actions"`
+	Health  *HealthSpec           `json:"health,omitempty"`
 	Timeout string                `json:"timeout"`
+}
+
+type HealthSpec struct {
+	Method   string `json:"method"`
+	Endpoint string `json:"endpoint"`
+	Timeout  string `json:"timeout"`
 }
 
 type ActionSpec struct {
