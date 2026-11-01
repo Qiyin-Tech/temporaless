@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"reflect"
 	"sync"
@@ -155,6 +156,85 @@ func TestManagerConcurrentMutationsRemainLinearizable(t *testing.T) {
 			t.Fatalf("final = %#v, last result = %#v", final, byRevision[3])
 		}
 	})
+}
+
+func TestManagerReadsRemainAvailableDuringWorkerSwitch(t *testing.T) {
+	t.Parallel()
+
+	store := openRegistry(t)
+	base := &fakeRuntime{activities: make(map[string]Activity)}
+	runtime := &gatedSetCurrentRuntime{fakeRuntime: base, entered: make(chan struct{}), release: make(chan struct{})}
+	manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: time.Second})
+	t.Cleanup(manager.Close)
+
+	putResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com/v1"))
+		putResult <- err
+	}()
+	select {
+	case <-runtime.entered:
+	case <-time.After(time.Second):
+		t.Fatal("PUT did not reach SetCurrent")
+	}
+
+	service, err := manager.Get(context.Background(), "service-a")
+	if err != nil || service.State != registry.ServiceStarting || service.CurrentRevision != 0 || service.LatestRevision != 1 {
+		t.Fatalf("GET during switch = %#v, %v", service, err)
+	}
+	services, err := manager.List(context.Background())
+	if err != nil || len(services) != 1 || services[0].LatestRevisionState != registry.RevisionStarting {
+		t.Fatalf("LIST during switch = %#v, %v", services, err)
+	}
+	if err := manager.Health(context.Background()); err != nil {
+		t.Fatalf("health during switch: %v", err)
+	}
+	close(runtime.release)
+	if err := <-putResult; err != nil {
+		t.Fatalf("PUT after switch release: %v", err)
+	}
+
+	stored := getStoredService(t, store, "service-a")
+	if stored.State != registry.ServiceActive || stored.CurrentRevision != 1 || stored.Current.State != registry.RevisionActive || stored.Latest.Number != 1 {
+		t.Fatalf("final service after switch = %#v", stored)
+	}
+}
+
+func TestManagerConcurrentDifferentServicesKeepRevisionStateIsolated(t *testing.T) {
+	t.Parallel()
+
+	store := openRegistry(t)
+	runtime := &fakeRuntime{activities: make(map[string]Activity)}
+	manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: time.Second})
+	t.Cleanup(manager.Close)
+
+	const services = 12
+	start := make(chan struct{})
+	results := make(chan error, services)
+	for i := range services {
+		serviceID := fmt.Sprintf("service-%02d", i)
+		go func() {
+			<-start
+			_, err := manager.Put(context.Background(), serviceID, serviceSpec("https://example.com/"+serviceID))
+			results <- err
+		}()
+	}
+	close(start)
+	for range services {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	listed, err := store.List(context.Background())
+	if err != nil || len(listed) != services {
+		t.Fatalf("services = %d, err=%v", len(listed), err)
+	}
+	for i, service := range listed {
+		if service.ID != fmt.Sprintf("service-%02d", i) || service.CurrentRevision != 1 || service.Latest.Number != 1 || service.Current.Hash != service.Latest.Hash || service.State != registry.ServiceActive {
+			t.Fatalf("service %d state crossed between concurrent operations: %#v", i, service)
+		}
+	}
 }
 
 func TestManagerRejectsCanceledMutationAfterWaitingForLock(t *testing.T) {
@@ -670,6 +750,34 @@ func TestManagerCloseStopsWorkersConcurrently(t *testing.T) {
 	}
 }
 
+func TestConcurrentManagerCloseStopsEachWorkerOnce(t *testing.T) {
+	t.Parallel()
+
+	runtime := &fakeRuntime{activities: make(map[string]Activity)}
+	manager := NewManager(openRegistry(t), runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: time.Second})
+	if _, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com/v1")); err != nil {
+		t.Fatal(err)
+	}
+
+	const closers = 8
+	start := make(chan struct{})
+	var closeGroup sync.WaitGroup
+	closeGroup.Add(closers)
+	for range closers {
+		go func() {
+			defer closeGroup.Done()
+			<-start
+			manager.Close()
+		}()
+	}
+	close(start)
+	closeGroup.Wait()
+
+	if got := runtime.eventsSnapshot(); !reflect.DeepEqual(got, []string{"start:r1", "current:r1", "stop:r1"}) {
+		t.Fatalf("events after concurrent Close = %#v", got)
+	}
+}
+
 func TestManagerRejectsOperationsAfterClose(t *testing.T) {
 	t.Parallel()
 
@@ -740,6 +848,23 @@ type fakeRuntime struct {
 	setErrors    []error
 	setError     error
 	currentError error
+}
+
+type gatedSetCurrentRuntime struct {
+	*fakeRuntime
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *gatedSetCurrentRuntime) SetCurrent(ctx context.Context, serviceID, buildID string) error {
+	r.once.Do(func() { close(r.entered) })
+	select {
+	case <-r.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return r.fakeRuntime.SetCurrent(ctx, serviceID, buildID)
 }
 
 func (r *fakeRuntime) Start(_ string, buildID string, activity Activity) (Worker, error) {

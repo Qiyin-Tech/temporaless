@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"temporaless/internal/registry"
 
@@ -179,6 +180,59 @@ func TestAPIHealth(t *testing.T) {
 	response := request(t, handler, http.MethodGet, "/healthz", "")
 	if response.Code != http.StatusOK || response.Body.String() != "{\"status\":\"ok\"}\n" {
 		t.Fatalf("health = %d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestAPIReadsStayAvailableDuringRevisionSwitch(t *testing.T) {
+	t.Parallel()
+
+	store := openRegistry(t)
+	base := &fakeRuntime{activities: make(map[string]Activity)}
+	runtime := &gatedSetCurrentRuntime{fakeRuntime: base, entered: make(chan struct{}), release: make(chan struct{})}
+	manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: time.Second})
+	t.Cleanup(manager.Close)
+	handler := NewAPI(manager, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	putResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPut, "/services/service-a", strings.NewReader(`{"actions":{"invoke":{"method":"POST","endpoint":"https://example.com"}},"timeout":"1s"}`))
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		putResult <- response
+	}()
+	select {
+	case <-runtime.entered:
+	case <-time.After(time.Second):
+		t.Fatal("PUT did not reach SetCurrent")
+	}
+
+	get := request(t, handler, http.MethodGet, "/services/service-a", "")
+	var service ServiceView
+	decodeResponse(t, get, &service)
+	if get.Code != http.StatusOK || service.State != registry.ServiceStarting || service.LatestRevision != 1 {
+		t.Fatalf("GET during switch = %d %#v", get.Code, service)
+	}
+	list := request(t, handler, http.MethodGet, "/services", "")
+	var services []ServiceView
+	decodeResponse(t, list, &services)
+	if list.Code != http.StatusOK || len(services) != 1 || services[0].LatestRevisionState != registry.RevisionStarting {
+		t.Fatalf("LIST during switch = %d %#v", list.Code, services)
+	}
+	health := request(t, handler, http.MethodGet, "/healthz", "")
+	if health.Code != http.StatusOK {
+		t.Fatalf("health during switch = %d %s", health.Code, health.Body.String())
+	}
+
+	close(runtime.release)
+	put := <-putResult
+	if put.Code != http.StatusOK {
+		t.Fatalf("PUT after switch release = %d %s", put.Code, put.Body.String())
+	}
+	get = request(t, handler, http.MethodGet, "/services/service-a", "")
+	decodeResponse(t, get, &service)
+	if service.State != registry.ServiceActive || service.CurrentRevision != 1 || service.RevisionState != registry.RevisionActive {
+		t.Fatalf("service after switch = %#v", service)
 	}
 }
 

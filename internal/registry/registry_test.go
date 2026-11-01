@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -142,6 +144,89 @@ func TestListJoinsCurrentAndLatestRevisions(t *testing.T) {
 	}
 	if service := services[1]; service.ID != "service-b" || service.CurrentRevision != 0 || service.Latest.Number != 1 || service.Latest.State != RevisionFailed {
 		t.Fatalf("service-b = %#v", service)
+	}
+}
+
+func TestConcurrentListReturnsConsistentJoinedRevisionSnapshots(t *testing.T) {
+	t.Parallel()
+
+	store := openTestRegistry(t)
+	const writers = 12
+	start := make(chan struct{})
+	var errorsMu sync.Mutex
+	var errorsFound []error
+	recordError := func(err error) {
+		errorsMu.Lock()
+		defer errorsMu.Unlock()
+		errorsFound = append(errorsFound, err)
+	}
+	var writerGroup, readerGroup sync.WaitGroup
+	writerGroup.Add(writers)
+	for i := range writers {
+		serviceID := fmt.Sprintf("service-%02d", i)
+		go func() {
+			defer writerGroup.Done()
+			<-start
+			ctx := context.Background()
+			revision, _, err := store.Prepare(ctx, serviceID, KindService, []byte(`{"v":1}`), serviceID+"-r1")
+			if err != nil {
+				recordError(fmt.Errorf("prepare %s: %w", serviceID, err))
+				return
+			}
+			if err := store.Activate(ctx, serviceID, revision.Number); err != nil {
+				recordError(fmt.Errorf("activate %s: %w", serviceID, err))
+				return
+			}
+			latest, _, err := store.Prepare(ctx, serviceID, KindService, []byte(`{"v":2}`), serviceID+"-r2")
+			if err != nil {
+				recordError(fmt.Errorf("prepare update %s: %w", serviceID, err))
+				return
+			}
+			if err := store.MarkFailed(ctx, serviceID, latest.Number); err != nil {
+				recordError(fmt.Errorf("fail update %s: %w", serviceID, err))
+			}
+		}()
+	}
+	for range 3 {
+		readerGroup.Add(1)
+		go func() {
+			defer readerGroup.Done()
+			<-start
+			for range 40 {
+				services, err := store.List(context.Background())
+				if err != nil {
+					recordError(fmt.Errorf("list: %w", err))
+					continue
+				}
+				for _, service := range services {
+					if service.CurrentRevision == 0 {
+						if service.State != ServiceStarting || service.Latest.State != RevisionStarting {
+							recordError(fmt.Errorf("inconsistent initial snapshot: %#v", service))
+						}
+						continue
+					}
+					if service.Current.Number != service.CurrentRevision || service.Current.State != RevisionActive || service.State != ServiceActive || service.Latest.Number < service.CurrentRevision {
+						recordError(fmt.Errorf("inconsistent joined snapshot: %#v", service))
+					}
+				}
+			}
+		}()
+	}
+	close(start)
+	writerGroup.Wait()
+	readerGroup.Wait()
+	for _, err := range errorsFound {
+		t.Error(err)
+	}
+
+	services, err := store.List(context.Background())
+	if err != nil || len(services) != writers {
+		t.Fatalf("final List returned %d services, err=%v", len(services), err)
+	}
+	for i, service := range services {
+		if service.ID != fmt.Sprintf("service-%02d", i) || service.State != ServiceActive || service.CurrentRevision != 1 || service.Latest.Number != 2 || service.Latest.State != RevisionFailed {
+			t.Fatalf("final service %d = %#v", i, service)
+		}
 	}
 }
 
