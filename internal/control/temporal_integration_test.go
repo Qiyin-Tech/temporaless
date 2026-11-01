@@ -34,6 +34,8 @@ func integrationWorkflow(ctx workflow.Context, args integrationWorkflowArgs) (te
 		TaskQueue:              args.TaskQueue,
 		ScheduleToCloseTimeout: 30 * time.Second,
 		StartToCloseTimeout:    10 * time.Second,
+		HeartbeatTimeout:       2 * time.Second,
+		WaitForCancellation:    true,
 		RetryPolicy:            &temporal.RetryPolicy{MaximumAttempts: 1},
 	})
 	var response temporaless.Response
@@ -68,12 +70,20 @@ func TestManagerWithTemporal(t *testing.T) {
 	const concurrentCalls = 4
 	blockedStarted := make(chan struct{}, concurrentCalls)
 	blockedRelease := make(chan struct{})
+	cancelStarted := make(chan struct{}, 1)
+	cancelObserved := make(chan struct{}, 1)
 	var blockV1 atomic.Bool
 	var releaseOnce sync.Once
 	releaseBlocked := func() { releaseOnce.Do(func() { close(blockedRelease) }) }
 	defer releaseBlocked()
 	backendServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		body, _ := io.ReadAll(request.Body)
+		if request.Header.Get("X-Test-Cancel") == "true" {
+			cancelStarted <- struct{}{}
+			<-request.Context().Done()
+			cancelObserved <- struct{}{}
+			return
+		}
 		if request.URL.Path == "/v1" && blockV1.Load() {
 			blockedStarted <- struct{}{}
 			select {
@@ -92,7 +102,7 @@ func TestManagerWithTemporal(t *testing.T) {
 		t.Fatalf("open registry: %v", err)
 	}
 	defer store.Close()
-	runtime := NewTemporalRuntime(temporalClient, 5*time.Second)
+	runtime := NewTemporalRuntime(temporalClient, 5*time.Second, concurrentCalls)
 	manager := NewManager(store, runtime, backendServer.Client(), ManagerOptions{SwitchTimeout: 15 * time.Second})
 	defer manager.Close()
 
@@ -136,6 +146,28 @@ func TestManagerWithTemporal(t *testing.T) {
 		t.Fatalf("put r2: %v", err)
 	}
 	assertIntegrationCall(t, ctx, temporalClient, workflowQueue, workflowType, serviceID, suffix+"-r2", "/v2:payload")
+
+	cancelWorkflowID := suffix + "-cancel"
+	cancelRun := startIntegrationRequest(t, ctx, temporalClient, workflowQueue, workflowType, serviceID, cancelWorkflowID, temporaless.Request{
+		Action:  "invoke",
+		Headers: http.Header{"X-Test-Cancel": {"true"}},
+	})
+	select {
+	case <-cancelStarted:
+	case <-ctx.Done():
+		t.Fatalf("wait for cancellable backend request: %v", ctx.Err())
+	}
+	if err := temporalClient.CancelWorkflow(ctx, cancelWorkflowID, cancelRun.GetRunID()); err != nil {
+		t.Fatalf("cancel workflow: %v", err)
+	}
+	select {
+	case <-cancelObserved:
+	case <-ctx.Done():
+		t.Fatalf("backend did not observe cancellation: %v", ctx.Err())
+	}
+	if err := cancelRun.Get(ctx, nil); !temporal.IsCanceledError(err) {
+		t.Fatalf("canceled workflow error = %T %v", err, err)
+	}
 
 	if _, err := manager.Delete(ctx, serviceID); err != nil {
 		t.Fatalf("delete: %v", err)
@@ -206,13 +238,27 @@ func startIntegrationCall(
 	workflowID string,
 ) client.WorkflowRun {
 	t.Helper()
+	return startIntegrationRequest(t, ctx, temporalClient, workflowQueue, workflowType, serviceID, workflowID, temporaless.Request{
+		Action: "invoke",
+		Body:   []byte("payload"),
+	})
+}
+
+func startIntegrationRequest(
+	t *testing.T,
+	ctx context.Context,
+	temporalClient client.Client,
+	workflowQueue string,
+	workflowType string,
+	serviceID string,
+	workflowID string,
+	request temporaless.Request,
+) client.WorkflowRun {
+	t.Helper()
 	run, err := temporalClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: workflowID, TaskQueue: workflowQueue}, workflowType, integrationWorkflowArgs{
 		TaskQueue:    serviceID,
 		ActivityType: serviceID + "/invoke",
-		Request: temporaless.Request{
-			Action: "invoke",
-			Body:   []byte("payload"),
-		},
+		Request:      request,
 	})
 	if err != nil {
 		t.Fatalf("start workflow: %v", err)

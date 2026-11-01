@@ -2,7 +2,11 @@ package registry
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -36,6 +40,12 @@ func TestRevisionLifecycle(t *testing.T) {
 	starting, err := store.ListStarting(ctx)
 	if err != nil || len(starting) != 1 || starting[0].Number != 2 {
 		t.Fatalf("starting revisions = %#v err=%v", starting, err)
+	}
+	if err := store.MarkSwitchStarted(ctx, "image.generate", 2); err != nil {
+		t.Fatalf("mark switch started: %v", err)
+	}
+	if switching := getRevision(t, store, "image.generate", 2); !switching.SwitchStarted {
+		t.Fatalf("switch_started = false: %#v", switching)
 	}
 	services, err := store.List(ctx)
 	if err != nil || len(services) != 1 || services[0].CurrentRevision != 1 {
@@ -95,6 +105,199 @@ func TestFailedRevisionDoesNotReplaceCurrent(t *testing.T) {
 	}
 }
 
+func TestListJoinsCurrentAndLatestRevisions(t *testing.T) {
+	t.Parallel()
+
+	store := openTestRegistry(t)
+	ctx := context.Background()
+	current, _, err := store.Prepare(ctx, "service-a", KindService, []byte(`{"v":1}`), "hash-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Activate(ctx, "service-a", current.Number); err != nil {
+		t.Fatal(err)
+	}
+	latest, _, err := store.Prepare(ctx, "service-a", KindService, []byte(`{"v":2}`), "hash-a2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFailed(ctx, "service-a", latest.Number); err != nil {
+		t.Fatal(err)
+	}
+	failed, _, err := store.Prepare(ctx, "service-b", KindService, []byte(`{"v":1}`), "hash-b1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFailed(ctx, "service-b", failed.Number); err != nil {
+		t.Fatal(err)
+	}
+
+	services, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(services) != 2 {
+		t.Fatalf("services = %#v", services)
+	}
+	if service := services[0]; service.ID != "service-a" || service.Current.Number != 1 || service.Current.Hash != "hash-a1" || service.Latest.Number != 2 || service.Latest.Hash != "hash-a2" {
+		t.Fatalf("service-a = %#v", service)
+	}
+	if service := services[1]; service.ID != "service-b" || service.CurrentRevision != 0 || service.Latest.Number != 1 || service.Latest.State != RevisionFailed {
+		t.Fatalf("service-b = %#v", service)
+	}
+}
+
+func TestConcurrentListReturnsConsistentJoinedRevisionSnapshots(t *testing.T) {
+	t.Parallel()
+
+	store := openTestRegistry(t)
+	const writers = 12
+	start := make(chan struct{})
+	var errorsMu sync.Mutex
+	var errorsFound []error
+	recordError := func(err error) {
+		errorsMu.Lock()
+		defer errorsMu.Unlock()
+		errorsFound = append(errorsFound, err)
+	}
+	var writerGroup, readerGroup sync.WaitGroup
+	writerGroup.Add(writers)
+	for i := range writers {
+		serviceID := fmt.Sprintf("service-%02d", i)
+		go func() {
+			defer writerGroup.Done()
+			<-start
+			ctx := context.Background()
+			revision, _, err := store.Prepare(ctx, serviceID, KindService, []byte(`{"v":1}`), serviceID+"-r1")
+			if err != nil {
+				recordError(fmt.Errorf("prepare %s: %w", serviceID, err))
+				return
+			}
+			if err := store.Activate(ctx, serviceID, revision.Number); err != nil {
+				recordError(fmt.Errorf("activate %s: %w", serviceID, err))
+				return
+			}
+			latest, _, err := store.Prepare(ctx, serviceID, KindService, []byte(`{"v":2}`), serviceID+"-r2")
+			if err != nil {
+				recordError(fmt.Errorf("prepare update %s: %w", serviceID, err))
+				return
+			}
+			if err := store.MarkFailed(ctx, serviceID, latest.Number); err != nil {
+				recordError(fmt.Errorf("fail update %s: %w", serviceID, err))
+			}
+		}()
+	}
+	for range 3 {
+		readerGroup.Add(1)
+		go func() {
+			defer readerGroup.Done()
+			<-start
+			for range 40 {
+				services, err := store.List(context.Background())
+				if err != nil {
+					recordError(fmt.Errorf("list: %w", err))
+					continue
+				}
+				for _, service := range services {
+					if service.CurrentRevision == 0 {
+						if service.State != ServiceStarting || service.Latest.State != RevisionStarting {
+							recordError(fmt.Errorf("inconsistent initial snapshot: %#v", service))
+						}
+						continue
+					}
+					if service.Current.Number != service.CurrentRevision || service.Current.State != RevisionActive || service.State != ServiceActive || service.Latest.Number < service.CurrentRevision {
+						recordError(fmt.Errorf("inconsistent joined snapshot: %#v", service))
+					}
+				}
+			}
+		}()
+	}
+	close(start)
+	writerGroup.Wait()
+	readerGroup.Wait()
+	for _, err := range errorsFound {
+		t.Error(err)
+	}
+
+	services, err := store.List(context.Background())
+	if err != nil || len(services) != writers {
+		t.Fatalf("final List returned %d services, err=%v", len(services), err)
+	}
+	for i, service := range services {
+		if service.ID != fmt.Sprintf("service-%02d", i) || service.State != ServiceActive || service.CurrentRevision != 1 || service.Latest.Number != 2 || service.Latest.State != RevisionFailed {
+			t.Fatalf("final service %d = %#v", i, service)
+		}
+	}
+}
+
+func TestConcurrentGetReturnsConsistentJoinedRevisionSnapshots(t *testing.T) {
+	t.Parallel()
+
+	store := openTestRegistry(t)
+	ctx := context.Background()
+	first, _, err := store.Prepare(ctx, "service-a", KindService, []byte(`{"v":1}`), "hash-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Activate(ctx, "service-a", first.Number); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	errorsFound := make(chan error, 1)
+	report := func(err error) {
+		select {
+		case errorsFound <- err:
+		default:
+		}
+	}
+	var readers sync.WaitGroup
+	readers.Add(4)
+	for range 4 {
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				service, err := store.Get(ctx, "service-a")
+				if err != nil {
+					report(err)
+					return
+				}
+				if service.CurrentRevision != service.Current.Number || service.Current.State != RevisionActive || service.State != ServiceActive || service.Latest.Number < service.CurrentRevision {
+					report(fmt.Errorf("inconsistent joined Get snapshot: %#v", service))
+					return
+				}
+			}
+		}()
+	}
+
+	var writerErr error
+	for revision := 2; revision <= 200; revision++ {
+		prepared, _, err := store.Prepare(ctx, "service-a", KindService, []byte(fmt.Sprintf(`{"v":%d}`, revision)), fmt.Sprintf("hash-%d", revision))
+		if err == nil {
+			err = store.Activate(ctx, "service-a", prepared.Number)
+		}
+		if err != nil {
+			writerErr = err
+			break
+		}
+	}
+	close(done)
+	readers.Wait()
+	if writerErr != nil {
+		t.Fatal(writerErr)
+	}
+	select {
+	case err := <-errorsFound:
+		t.Fatal(err)
+	default:
+	}
+}
+
 func TestTombstoneMissingService(t *testing.T) {
 	t.Parallel()
 
@@ -124,8 +327,48 @@ func TestInvalidRevisionTransitions(t *testing.T) {
 	if err := store.Activate(ctx, "service-a", revision.Number); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("activate failed revision error = %v", err)
 	}
+	if err := store.MarkSwitchStarted(ctx, "service-a", revision.Number); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("mark failed revision switching error = %v", err)
+	}
 	if _, err := store.Get(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("get missing error = %v", err)
+	}
+}
+
+func TestMigrationTreatsExistingStartingRevisionAsSwitchAttempted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE services (
+			id TEXT PRIMARY KEY, state TEXT NOT NULL, current_revision INTEGER,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		);
+		CREATE TABLE service_revisions (
+			service_id TEXT NOT NULL, revision INTEGER NOT NULL, kind TEXT NOT NULL,
+			state TEXT NOT NULL, spec_json BLOB, config_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY (service_id, revision)
+		);
+		INSERT INTO services VALUES ('service-a', 'starting', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+		INSERT INTO service_revisions VALUES ('service-a', 1, 'service', 'starting', '{}', 'hash', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+	`)
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if revision := getRevision(t, store, "service-a", 1); !revision.SwitchStarted {
+		t.Fatalf("migrated revision = %#v", revision)
 	}
 }
 

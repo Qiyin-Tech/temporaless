@@ -23,14 +23,34 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
+// DefaultMaxResponseBodyBytes is the default in-memory backend response limit.
+const DefaultMaxResponseBodyBytes int64 = 1 << 20
+
 var actionNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 
+// Revision is one compiled, immutable service configuration.
 type Revision struct {
-	actions  map[string]action
+	actions              map[string]action
+	timeout              time.Duration
+	client               *http.Client
+	maxResponseBodyBytes int64
+	specJSON             []byte
+	hash                 string
+}
+
+// HealthProbe executes one compiled direct HTTP backend health check.
+type HealthProbe struct {
+	method   string
+	endpoint string
 	timeout  time.Duration
 	client   *http.Client
-	specJSON []byte
-	hash     string
+}
+
+// HealthProbeResult reports the backend status and observed request latency.
+type HealthProbeResult struct {
+	Status  int
+	Message string
+	Latency time.Duration
 }
 
 type action struct {
@@ -41,7 +61,11 @@ type action struct {
 	responseSchemas map[int]*jsonschema.Schema
 }
 
-func Compile(spec temporaless.ServiceSpec, client *http.Client) (*Revision, error) {
+// Compile validates and normalizes a ServiceSpec into an immutable Revision.
+func Compile(spec temporaless.ServiceSpec, client *http.Client, maxResponseBodyBytes int64) (*Revision, error) {
+	if maxResponseBodyBytes <= 0 {
+		return nil, errors.New("max response body bytes must be positive")
+	}
 	timeout, err := time.ParseDuration(spec.Timeout)
 	if err != nil || timeout <= 0 {
 		return nil, fmt.Errorf("timeout must be a positive Go duration")
@@ -60,6 +84,11 @@ func Compile(spec temporaless.ServiceSpec, client *http.Client) (*Revision, erro
 		actions[name] = compiled
 		normalized.Actions[name] = normalizedSpec
 	}
+	health, err := normalizeHealthSpec(spec.Health)
+	if err != nil {
+		return nil, fmt.Errorf("health: %w", err)
+	}
+	normalized.Health = health
 
 	specJSON, err := json.Marshal(normalized)
 	if err != nil {
@@ -70,22 +99,26 @@ func Compile(spec temporaless.ServiceSpec, client *http.Client) (*Revision, erro
 		client = http.DefaultClient
 	}
 	return &Revision{
-		actions:  actions,
-		timeout:  timeout,
-		client:   client,
-		specJSON: specJSON,
-		hash:     hex.EncodeToString(sum[:]),
+		actions:              actions,
+		timeout:              timeout,
+		client:               client,
+		maxResponseBodyBytes: maxResponseBodyBytes,
+		specJSON:             specJSON,
+		hash:                 hex.EncodeToString(sum[:]),
 	}, nil
 }
 
+// SpecJSON returns a copy of the normalized ServiceSpec JSON.
 func (r *Revision) SpecJSON() []byte {
 	return bytes.Clone(r.specJSON)
 }
 
+// Hash returns the normalized ServiceSpec content hash.
 func (r *Revision) Hash() string {
 	return r.hash
 }
 
+// Invoke validates and forwards one Activity request to its configured HTTP action.
 func (r *Revision) Invoke(ctx context.Context, request temporaless.Request) (temporaless.Response, error) {
 	action, ok := r.actions[request.Action]
 	if !ok {
@@ -113,9 +146,12 @@ func (r *Revision) Invoke(ctx context.Context, request temporaless.Request) (tem
 		return temporaless.Response{}, fmt.Errorf("call backend: %w", err)
 	}
 	defer httpResponse.Body.Close()
-	body, err := io.ReadAll(httpResponse.Body)
+	body, err := io.ReadAll(io.LimitReader(httpResponse.Body, r.maxResponseBodyBytes+1))
 	if err != nil {
 		return temporaless.Response{}, fmt.Errorf("read backend response: %w", err)
+	}
+	if int64(len(body)) > r.maxResponseBodyBytes {
+		return temporaless.Response{}, temporal.NewNonRetryableApplicationError(fmt.Sprintf("backend response body exceeds %d bytes", r.maxResponseBodyBytes), "ResponseTooLarge", nil)
 	}
 	if err := validateBody(action.responseSchemas[httpResponse.StatusCode], httpResponse.Header.Get("Content-Type"), body); err != nil {
 		return temporaless.Response{}, temporal.NewNonRetryableApplicationError("response body does not match schema", "ResponseSchemaMismatch", nil)
@@ -132,12 +168,9 @@ func compileAction(name string, spec temporaless.ActionSpec) (action, temporales
 	if !actionNamePattern.MatchString(name) {
 		return action{}, temporaless.ActionSpec{}, errors.New("name must match ^[a-z0-9][a-z0-9._-]{0,127}$")
 	}
-	method := strings.ToUpper(strings.TrimSpace(spec.Method))
-	if method == "" {
-		return action{}, temporaless.ActionSpec{}, errors.New("method is required")
-	}
-	if _, err := http.NewRequest(method, "http://example.com", nil); err != nil {
-		return action{}, temporaless.ActionSpec{}, fmt.Errorf("invalid method: %w", err)
+	method, err := normalizeMethod(spec.Method)
+	if err != nil {
+		return action{}, temporaless.ActionSpec{}, err
 	}
 	endpointText, hasJobID, err := normalizeEndpoint(spec.Endpoint)
 	if err != nil {
@@ -167,6 +200,79 @@ func compileAction(name string, spec temporaless.ActionSpec) (action, temporales
 		}, nil
 }
 
+// NewHealthProbe validates HealthSpec and returns an executable probe.
+func NewHealthProbe(spec temporaless.HealthSpec, client *http.Client) (*HealthProbe, error) {
+	normalized, err := normalizeHealthSpec(&spec)
+	if err != nil {
+		return nil, err
+	}
+	timeout, _ := time.ParseDuration(normalized.Timeout)
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &HealthProbe{
+		method:   normalized.Method,
+		endpoint: normalized.Endpoint,
+		timeout:  timeout,
+		client:   client,
+	}, nil
+}
+
+// Check calls the configured endpoint and returns its final HTTP status and latency.
+func (p *HealthProbe) Check(ctx context.Context) (HealthProbeResult, error) {
+	started := time.Now()
+	requestCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, p.method, p.endpoint, nil)
+	if err != nil {
+		return HealthProbeResult{Latency: time.Since(started)}, err
+	}
+	response, err := p.client.Do(request)
+	latency := time.Since(started)
+	if err != nil {
+		return HealthProbeResult{Latency: latency}, err
+	}
+	defer response.Body.Close()
+	return HealthProbeResult{
+		Status:  response.StatusCode,
+		Message: http.StatusText(response.StatusCode),
+		Latency: latency,
+	}, nil
+}
+
+func normalizeHealthSpec(spec *temporaless.HealthSpec) (*temporaless.HealthSpec, error) {
+	if spec == nil {
+		return nil, nil
+	}
+	method, err := normalizeMethod(spec.Method)
+	if err != nil {
+		return nil, err
+	}
+	endpoint, hasJobID, err := normalizeEndpoint(spec.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if hasJobID {
+		return nil, errors.New("{job_id} is not allowed in health endpoint")
+	}
+	timeout, err := time.ParseDuration(spec.Timeout)
+	if err != nil || timeout <= 0 {
+		return nil, errors.New("timeout must be a positive Go duration")
+	}
+	return &temporaless.HealthSpec{Method: method, Endpoint: endpoint, Timeout: timeout.String()}, nil
+}
+
+func normalizeMethod(raw string) (string, error) {
+	method := strings.ToUpper(strings.TrimSpace(raw))
+	if method == "" {
+		return "", errors.New("method is required")
+	}
+	if _, err := http.NewRequest(method, "http://example.com", nil); err != nil {
+		return "", fmt.Errorf("invalid method: %w", err)
+	}
+	return method, nil
+}
+
 func normalizeEndpoint(raw string) (string, bool, error) {
 	endpointText := strings.TrimSpace(raw)
 	endpoint, err := url.Parse(endpointText)
@@ -177,11 +283,11 @@ func normalizeEndpoint(raw string) (string, bool, error) {
 	if strings.ContainsAny(withoutJobID, "{}") {
 		return "", false, errors.New("endpoint contains an unsupported placeholder")
 	}
-	hasJobID := strings.Contains(endpointText, "{job_id}")
-	if hasJobID && !strings.Contains(endpoint.Path, "{job_id}") {
+	pathPlaceholders := strings.Count(endpoint.Path, "{job_id}")
+	if strings.Count(endpointText, "{job_id}") != pathPlaceholders {
 		return "", false, errors.New("{job_id} is only allowed in the URL path")
 	}
-	return endpointText, hasJobID, nil
+	return endpointText, pathPlaceholders > 0, nil
 }
 
 func compileResponseSchemas(rawSchemas map[string]json.RawMessage) (map[int]*jsonschema.Schema, map[string]json.RawMessage, error) {

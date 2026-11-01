@@ -5,14 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"temporaless/internal/registry"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestAPIServiceLifecycle(t *testing.T) {
@@ -40,6 +44,12 @@ func TestAPIServiceLifecycle(t *testing.T) {
 	get := request(t, handler, http.MethodGet, "/services/image-generate", "")
 	if get.Code != http.StatusOK {
 		t.Fatalf("GET status = %d body=%s", get.Code, get.Body.String())
+	}
+	health := request(t, handler, http.MethodGet, "/services/image-generate/health", "")
+	var healthView ServiceHealthView
+	decodeResponse(t, health, &healthView)
+	if health.Code != http.StatusOK || healthView.Health != "not_configured" {
+		t.Fatalf("health without config = %d %#v", health.Code, healthView)
 	}
 
 	list := request(t, handler, http.MethodGet, "/services", "")
@@ -170,6 +180,139 @@ func TestAPIHealth(t *testing.T) {
 	response := request(t, handler, http.MethodGet, "/healthz", "")
 	if response.Code != http.StatusOK || response.Body.String() != "{\"status\":\"ok\"}\n" {
 		t.Fatalf("health = %d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestAPIReadsStayAvailableDuringRevisionSwitch(t *testing.T) {
+	t.Parallel()
+
+	store := openRegistry(t)
+	base := &fakeRuntime{activities: make(map[string]Activity)}
+	runtime := &gatedSetCurrentRuntime{fakeRuntime: base, entered: make(chan struct{}), release: make(chan struct{})}
+	manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: time.Second})
+	t.Cleanup(manager.Close)
+	handler := NewAPI(manager, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	putResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPut, "/services/service-a", strings.NewReader(`{"actions":{"invoke":{"method":"POST","endpoint":"https://example.com"}},"timeout":"1s"}`))
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		putResult <- response
+	}()
+	select {
+	case <-runtime.entered:
+	case <-time.After(time.Second):
+		t.Fatal("PUT did not reach SetCurrent")
+	}
+
+	get := request(t, handler, http.MethodGet, "/services/service-a", "")
+	var service ServiceView
+	decodeResponse(t, get, &service)
+	if get.Code != http.StatusOK || service.State != registry.ServiceStarting || service.LatestRevision != 1 {
+		t.Fatalf("GET during switch = %d %#v", get.Code, service)
+	}
+	list := request(t, handler, http.MethodGet, "/services", "")
+	var services []ServiceView
+	decodeResponse(t, list, &services)
+	if list.Code != http.StatusOK || len(services) != 1 || services[0].LatestRevisionState != registry.RevisionStarting {
+		t.Fatalf("LIST during switch = %d %#v", list.Code, services)
+	}
+	health := request(t, handler, http.MethodGet, "/healthz", "")
+	if health.Code != http.StatusOK {
+		t.Fatalf("health during switch = %d %s", health.Code, health.Body.String())
+	}
+
+	close(runtime.release)
+	put := <-putResult
+	if put.Code != http.StatusOK {
+		t.Fatalf("PUT after switch release = %d %s", put.Code, put.Body.String())
+	}
+	get = request(t, handler, http.MethodGet, "/services/service-a", "")
+	decodeResponse(t, get, &service)
+	if service.State != registry.ServiceActive || service.CurrentRevision != 1 || service.RevisionState != registry.RevisionActive {
+		t.Fatalf("service after switch = %#v", service)
+	}
+}
+
+func TestAPIDocumentation(t *testing.T) {
+	t.Parallel()
+
+	handler := NewAPI(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	openAPI := request(t, handler, http.MethodGet, "/openapi.yaml", "")
+	if openAPI.Code != http.StatusOK || openAPI.Header().Get("Content-Type") != "application/yaml" || !strings.Contains(openAPI.Body.String(), "openapi: 3.1.0") {
+		t.Fatalf("OpenAPI response = %d %q", openAPI.Code, openAPI.Body.String())
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal(openAPI.Body.Bytes(), &document); err != nil {
+		t.Fatalf("decode OpenAPI: %v", err)
+	}
+	paths, ok := document["paths"].(map[string]any)
+	if !ok {
+		t.Fatalf("OpenAPI paths = %#v", document["paths"])
+	}
+	for _, path := range []string{"/services", "/services/{id}", "/services/{id}/health", "/healthz"} {
+		if _, ok := paths[path]; !ok {
+			t.Errorf("OpenAPI missing path %s", path)
+		}
+	}
+	swagger := request(t, handler, http.MethodGet, "/docs", "")
+	if swagger.Code != http.StatusOK || !strings.Contains(swagger.Body.String(), "SwaggerUIBundle") {
+		t.Fatalf("Swagger response = %d %q", swagger.Code, swagger.Body.String())
+	}
+}
+
+func TestAPIServiceHealth(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		backend    int
+		wantStatus int
+		wantHealth string
+	}{
+		{name: "healthy", backend: http.StatusNoContent, wantStatus: http.StatusOK, wantHealth: "healthy"},
+		{name: "unhealthy", backend: http.StatusTeapot, wantStatus: http.StatusServiceUnavailable, wantHealth: "unhealthy"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var method string
+			backendServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				method = request.Method
+				response.WriteHeader(test.backend)
+			}))
+			defer backendServer.Close()
+
+			store := openRegistry(t)
+			manager := NewManager(store, &fakeRuntime{activities: make(map[string]Activity)}, backendServer.Client(), ManagerOptions{})
+			t.Cleanup(manager.Close)
+			var logs bytes.Buffer
+			handler := NewAPI(manager, slog.New(slog.NewTextHandler(&logs, nil)))
+			put := request(t, handler, http.MethodPut, "/services/service-a", fmt.Sprintf(`{
+				"actions":{"invoke":{"method":"POST","endpoint":"https://example.com"}},
+				"health":{"method":"post","endpoint":%q,"timeout":"2s"},
+				"timeout":"5s"
+			}`, backendServer.URL))
+			if put.Code != http.StatusOK {
+				t.Fatalf("PUT status = %d body=%s", put.Code, put.Body.String())
+			}
+
+			response := request(t, handler, http.MethodGet, "/services/service-a/health", "")
+			if response.Code != test.wantStatus {
+				t.Fatalf("health status = %d, want %d: %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			var health ServiceHealthView
+			decodeResponse(t, response, &health)
+			if health.Health != test.wantHealth || health.HTTPStatus != test.backend || health.LatencyMS <= 0 {
+				t.Fatalf("health = %#v", health)
+			}
+			if method != http.MethodPost {
+				t.Fatalf("health method = %q, want POST", method)
+			}
+			if !strings.Contains(logs.String(), "latency_ms=") {
+				t.Fatalf("health log missing latency: %s", logs.String())
+			}
+		})
 	}
 }
 

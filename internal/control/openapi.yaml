@@ -1,0 +1,290 @@
+openapi: 3.1.0
+info:
+  title: temporaless Control API
+  version: 0.1.0
+  description: Register, inspect, health-check, update, and tombstone HTTP-backed Temporal Activities.
+servers:
+  - url: /
+paths:
+  /services:
+    get:
+      operationId: listServices
+      summary: List all registered services
+      responses:
+        "200":
+          description: Services ordered by ID
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ServiceView"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /services/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ServiceID"
+    put:
+      operationId: putService
+      summary: Create, update, or restore a service
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServiceSpec"
+      responses:
+        "200":
+          description: Current service state after the Worker revision became current
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceView"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      operationId: getService
+      summary: Get one service and its revision state
+      responses:
+        "200":
+          description: Service state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceView"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteService
+      summary: Switch a service to a tombstone revision
+      responses:
+        "200":
+          description: Deleted service state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceView"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /services/{id}/health:
+    parameters:
+      - $ref: "#/components/parameters/ServiceID"
+    get:
+      operationId: getServiceHealth
+      summary: Run the optional HTTP backend health probe
+      responses:
+        "200":
+          description: Backend is healthy or no health probe is configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceHealthView"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Backend is unhealthy or the service is not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceHealthView"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /healthz:
+    get:
+      operationId: getGatewayHealth
+      summary: Check SQLite and Temporal Frontend connectivity
+      responses:
+        "200":
+          description: Gateway dependencies are available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayHealth"
+        "503":
+          description: At least one Gateway dependency is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  parameters:
+    ServiceID:
+      name: id
+      in: path
+      required: true
+      description: Stable service ID used for the Task Queue, Activity Type, and Worker Deployment.
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
+  responses:
+    InvalidRequest:
+      description: Invalid service ID, JSON document, ServiceSpec, endpoint, or schema
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Service not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnsupportedMediaType:
+      description: PUT requires application/json or application/*+json
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: SQLite, Temporal, or internal state operation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    ServiceSpec:
+      type: object
+      additionalProperties: false
+      required: [actions, timeout]
+      properties:
+        actions:
+          type: object
+          minProperties: 1
+          propertyNames:
+            pattern: "^[a-z0-9][a-z0-9._-]{0,127}$"
+          additionalProperties:
+            $ref: "#/components/schemas/ActionSpec"
+        health:
+          $ref: "#/components/schemas/HealthSpec"
+        timeout:
+          type: string
+          description: Positive Go duration used by backend Activity requests.
+          examples: [10s, 5m]
+    ActionSpec:
+      type: object
+      additionalProperties: false
+      required: [method, endpoint]
+      properties:
+        method:
+          type: string
+          examples: [POST]
+        endpoint:
+          type: string
+          format: uri
+          description: Absolute HTTP(S) URL. The path may contain {job_id}.
+        request_schema:
+          description: JSON Schema 2020-12 applied to JSON request bodies.
+        response_schemas:
+          type: object
+          description: JSON Schemas keyed by an exact decimal HTTP status.
+          additionalProperties: true
+    HealthSpec:
+      type: object
+      additionalProperties: false
+      required: [method, endpoint, timeout]
+      properties:
+        method:
+          type: string
+          examples: [GET]
+        endpoint:
+          type: string
+          format: uri
+          description: Absolute HTTP(S) URL without placeholders.
+        timeout:
+          type: string
+          description: Positive Go duration used only by this probe.
+          examples: [3s]
+    ServiceView:
+      type: object
+      required: [id, state, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        state:
+          $ref: "#/components/schemas/ServiceState"
+        current_revision:
+          type: integer
+          format: int64
+        revision_state:
+          $ref: "#/components/schemas/RevisionState"
+        revision_kind:
+          $ref: "#/components/schemas/RevisionKind"
+        latest_revision:
+          type: integer
+          format: int64
+        latest_revision_state:
+          $ref: "#/components/schemas/RevisionState"
+        spec:
+          $ref: "#/components/schemas/ServiceSpec"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ServiceHealthView:
+      type: object
+      required: [service_id, registry_state, health, checked_at]
+      properties:
+        service_id:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        registry_state:
+          $ref: "#/components/schemas/ServiceState"
+        health:
+          type: string
+          enum: [healthy, unhealthy, not_configured, not_ready]
+        http_status:
+          type: integer
+        latency_ms:
+          type: number
+          format: double
+        message:
+          type: string
+        checked_at:
+          type: string
+          format: date-time
+    ServiceState:
+      type: string
+      enum: [starting, active, deleted, failed]
+    RevisionState:
+      type: string
+      enum: [starting, active, draining, failed]
+    RevisionKind:
+      type: string
+      enum: [service, tombstone]
+    GatewayHealth:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string

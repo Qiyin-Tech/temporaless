@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -64,7 +65,7 @@ func TestRevisionInvokePreservesHTTPEnvelope(t *testing.T) {
 				},
 			},
 		},
-	}, server.Client())
+	}, server.Client(), DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestRevisionInvokeIsolatedAcrossConcurrentRequests(t *testing.T) {
 		Actions: map[string]temporaless.ActionSpec{
 			"status": {Method: http.MethodPost, Endpoint: server.URL + "/jobs/{job_id}"},
 		},
-	}, server.Client())
+	}, server.Client(), DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +168,7 @@ func TestRevisionInvokeRejectsInvalidInputBeforeHTTP(t *testing.T) {
 				RequestSchema: []byte(`{"type":"object","required":["name"]}`),
 			},
 		},
-	}, server.Client())
+	}, server.Client(), DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestRevisionInvokeRejectsInvalidInputBeforeHTTP(t *testing.T) {
 		Actions: map[string]temporaless.ActionSpec{
 			"status": {Method: http.MethodGet, Endpoint: server.URL + "/{job_id}"},
 		},
-	}, server.Client())
+	}, server.Client(), DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,12 +218,34 @@ func TestRevisionInvokeRejectsInvalidResponseSchema(t *testing.T) {
 				},
 			},
 		},
-	}, server.Client())
+	}, server.Client(), DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = revision.Invoke(context.Background(), temporaless.Request{Action: "invoke"})
 	assertApplicationError(t, err, "ResponseSchemaMismatch")
+}
+
+func TestRevisionInvokeRejectsOversizedResponse(t *testing.T) {
+	t.Parallel()
+
+	const maxResponseBodyBytes = 1024
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write(bytes.Repeat([]byte{0}, maxResponseBodyBytes+1))
+	}))
+	defer server.Close()
+	revision, err := Compile(temporaless.ServiceSpec{
+		Timeout: "5s",
+		Actions: map[string]temporaless.ActionSpec{
+			"invoke": {Method: http.MethodGet, Endpoint: server.URL},
+		},
+	}, server.Client(), maxResponseBodyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = revision.Invoke(context.Background(), temporaless.Request{Action: "invoke"})
+	assertApplicationError(t, err, "ResponseTooLarge")
 }
 
 func TestCompileRejectsInvalidServiceSpec(t *testing.T) {
@@ -241,17 +264,22 @@ func TestCompileRejectsInvalidServiceSpec(t *testing.T) {
 		{name: "missing host", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "POST", Endpoint: "https:///run"}}}},
 		{name: "unknown placeholder", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com/{other}"}}}},
 		{name: "placeholder in query", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com/?id={job_id}"}}}},
+		{name: "placeholder in path and query", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com/jobs/{job_id}?id={job_id}"}}}},
 		{name: "bad response status", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com", ResponseSchemas: map[string]json.RawMessage{"2xx": json.RawMessage(`{}`)}}}}},
 		{name: "low response status", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com", ResponseSchemas: map[string]json.RawMessage{"99": json.RawMessage(`{}`)}}}}},
 		{name: "high response status", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com", ResponseSchemas: map[string]json.RawMessage{"600": json.RawMessage(`{}`)}}}}},
 		{name: "non canonical response status", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com", ResponseSchemas: map[string]json.RawMessage{"0200": json.RawMessage(`{}`)}}}}},
 		{name: "multiple schema values", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com", RequestSchema: json.RawMessage(`{} {}`)}}}},
+		{name: "health missing method", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: validActions(), Health: &temporaless.HealthSpec{Endpoint: "https://example.com/health", Timeout: "1s"}}},
+		{name: "health relative endpoint", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: validActions(), Health: &temporaless.HealthSpec{Method: "GET", Endpoint: "/health", Timeout: "1s"}}},
+		{name: "health job placeholder", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: validActions(), Health: &temporaless.HealthSpec{Method: "GET", Endpoint: "https://example.com/{job_id}", Timeout: "1s"}}},
+		{name: "health invalid timeout", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: validActions(), Health: &temporaless.HealthSpec{Method: "GET", Endpoint: "https://example.com/health", Timeout: "later"}}},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := Compile(test.spec, http.DefaultClient); err == nil {
+			if _, err := Compile(test.spec, http.DefaultClient, DefaultMaxResponseBodyBytes); err == nil {
 				t.Fatal("Compile succeeded, want error")
 			}
 		})
@@ -266,7 +294,7 @@ func TestCompileCanonicalizesEquivalentSpecs(t *testing.T) {
 		Actions: map[string]temporaless.ActionSpec{
 			"invoke": {Method: " post ", Endpoint: " https://example.com/run ", RequestSchema: json.RawMessage(`{ "type": "object", "properties": {"x": {"type":"string"}} }`)},
 		},
-	}, nil)
+	}, nil, DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +303,7 @@ func TestCompileCanonicalizesEquivalentSpecs(t *testing.T) {
 		Actions: map[string]temporaless.ActionSpec{
 			"invoke": {Method: "POST", Endpoint: "https://example.com/run", RequestSchema: json.RawMessage(`{"properties":{"x":{"type":"string"}},"type":"object"}`)},
 		},
-	}, http.DefaultClient)
+	}, http.DefaultClient, DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +349,7 @@ func TestRevisionInvokeHonorsTimeout(t *testing.T) {
 		Actions: map[string]temporaless.ActionSpec{
 			"invoke": {Method: http.MethodPost, Endpoint: server.URL},
 		},
-	}, server.Client())
+	}, server.Client(), DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -330,7 +358,7 @@ func TestRevisionInvokeHonorsTimeout(t *testing.T) {
 	}
 }
 
-func TestRevisionInvokePropagatesCancellation(t *testing.T) {
+func TestRevisionInvokePropagatesContextCancellation(t *testing.T) {
 	t.Parallel()
 
 	started := make(chan struct{})
@@ -344,7 +372,7 @@ func TestRevisionInvokePropagatesCancellation(t *testing.T) {
 		Actions: map[string]temporaless.ActionSpec{
 			"invoke": {Method: http.MethodPost, Endpoint: server.URL},
 		},
-	}, server.Client())
+	}, server.Client(), DefaultMaxResponseBodyBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,5 +387,26 @@ func TestRevisionInvokePropagatesCancellation(t *testing.T) {
 	cancel()
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context canceled", err)
+	}
+}
+
+func TestHealthProbeHonorsTimeout(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	probe, err := NewHealthProbe(temporaless.HealthSpec{
+		Method:   http.MethodGet,
+		Endpoint: server.URL,
+		Timeout:  "20ms",
+	}, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := probe.Check(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) || result.Latency <= 0 {
+		t.Fatalf("health result = %#v error = %v, want deadline exceeded with latency", result, err)
 	}
 }

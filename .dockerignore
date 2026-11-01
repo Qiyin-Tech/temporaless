@@ -1,0 +1,14 @@
+.git
+.github
+.codex
+.agents
+.DS_Store
+docs
+examples
+smoke
+**/*_test.go
+**/testdata
+README.md
+temporaless*.yaml
+*.db
+*.db-*
