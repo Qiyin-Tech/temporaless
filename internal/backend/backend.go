@@ -23,10 +23,12 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
+// DefaultMaxResponseBodyBytes is the default in-memory backend response limit.
 const DefaultMaxResponseBodyBytes int64 = 1 << 20
 
 var actionNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 
+// Revision is one compiled, immutable service configuration.
 type Revision struct {
 	actions              map[string]action
 	timeout              time.Duration
@@ -36,6 +38,7 @@ type Revision struct {
 	hash                 string
 }
 
+// HealthProbe executes one compiled direct HTTP backend health check.
 type HealthProbe struct {
 	method   string
 	endpoint string
@@ -43,6 +46,7 @@ type HealthProbe struct {
 	client   *http.Client
 }
 
+// HealthProbeResult reports the backend status and observed request latency.
 type HealthProbeResult struct {
 	Status  int
 	Message string
@@ -57,6 +61,7 @@ type action struct {
 	responseSchemas map[int]*jsonschema.Schema
 }
 
+// Compile validates and normalizes a ServiceSpec into an immutable Revision.
 func Compile(spec temporaless.ServiceSpec, client *http.Client, maxResponseBodyBytes int64) (*Revision, error) {
 	if maxResponseBodyBytes <= 0 {
 		return nil, errors.New("max response body bytes must be positive")
@@ -103,14 +108,17 @@ func Compile(spec temporaless.ServiceSpec, client *http.Client, maxResponseBodyB
 	}, nil
 }
 
+// SpecJSON returns a copy of the normalized ServiceSpec JSON.
 func (r *Revision) SpecJSON() []byte {
 	return bytes.Clone(r.specJSON)
 }
 
+// Hash returns the normalized ServiceSpec content hash.
 func (r *Revision) Hash() string {
 	return r.hash
 }
 
+// Invoke validates and forwards one Activity request to its configured HTTP action.
 func (r *Revision) Invoke(ctx context.Context, request temporaless.Request) (temporaless.Response, error) {
 	action, ok := r.actions[request.Action]
 	if !ok {
@@ -192,6 +200,7 @@ func compileAction(name string, spec temporaless.ActionSpec) (action, temporales
 		}, nil
 }
 
+// NewHealthProbe validates HealthSpec and returns an executable probe.
 func NewHealthProbe(spec temporaless.HealthSpec, client *http.Client) (*HealthProbe, error) {
 	normalized, err := normalizeHealthSpec(&spec)
 	if err != nil {
@@ -209,6 +218,7 @@ func NewHealthProbe(spec temporaless.HealthSpec, client *http.Client) (*HealthPr
 	}, nil
 }
 
+// Check calls the configured endpoint and returns its final HTTP status and latency.
 func (p *HealthProbe) Check(ctx context.Context) (HealthProbeResult, error) {
 	started := time.Now()
 	requestCtx, cancel := context.WithTimeout(ctx, p.timeout)

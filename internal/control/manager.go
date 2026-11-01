@@ -21,14 +21,18 @@ import (
 
 var serviceIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,127}$`)
 
+// ErrInvalidArgument marks invalid service IDs and service configurations.
 var ErrInvalidArgument = errors.New("invalid argument")
 
+// Activity is the function signature registered with a Temporal Activity Worker.
 type Activity func(context.Context, temporaless.Request) (temporaless.Response, error)
 
+// Worker is the lifecycle surface Manager needs from a Temporal Worker.
 type Worker interface {
 	Stop()
 }
 
+// Runtime starts revision Workers and controls Worker Deployment routing.
 type Runtime interface {
 	Start(serviceID string, buildID string, activity Activity) (Worker, error)
 	SetCurrent(ctx context.Context, serviceID string, buildID string) error
@@ -36,12 +40,14 @@ type Runtime interface {
 	Ping(ctx context.Context) error
 }
 
+// ManagerOptions controls revision switching and backend response limits.
 type ManagerOptions struct {
 	SwitchTimeout               time.Duration
 	RetryInterval               time.Duration
 	MaxBackendResponseBodyBytes int64
 }
 
+// ServiceView is the REST representation of a service and its revision state.
 type ServiceView struct {
 	ID                  string                   `json:"id"`
 	State               registry.ServiceState    `json:"state"`
@@ -55,6 +61,7 @@ type ServiceView struct {
 	UpdatedAt           time.Time                `json:"updated_at"`
 }
 
+// ServiceHealthView is the REST result of one optional backend health probe.
 type ServiceHealthView struct {
 	ID            string                `json:"service_id"`
 	Revision      int64                 `json:"revision,omitempty"`
@@ -71,6 +78,7 @@ type workerKey struct {
 	revision  int64
 }
 
+// Manager serializes control-plane changes and reconciles SQLite with Temporal routing.
 type Manager struct {
 	registry *registry.Registry
 	runtime  Runtime
@@ -83,6 +91,7 @@ type Manager struct {
 	closeDone chan struct{}
 }
 
+// NewManager creates a control-plane manager using shared Registry, Runtime, and HTTP client instances.
 func NewManager(store *registry.Registry, runtime Runtime, client *http.Client, options ManagerOptions) *Manager {
 	if client == nil {
 		client = http.DefaultClient
@@ -106,6 +115,7 @@ func NewManager(store *registry.Registry, runtime Runtime, client *http.Client, 
 	}
 }
 
+// Put creates, updates, or restores a service and makes its new revision current.
 func (m *Manager) Put(ctx context.Context, serviceID string, spec temporaless.ServiceSpec) (ServiceView, error) {
 	if err := validateServiceID(serviceID); err != nil {
 		return ServiceView{}, err
@@ -140,6 +150,7 @@ func (m *Manager) Put(ctx context.Context, serviceID string, spec temporaless.Se
 	return m.getAfterOperation(serviceID)
 }
 
+// Delete creates and activates a tombstone revision for a service.
 func (m *Manager) Delete(ctx context.Context, serviceID string) (ServiceView, error) {
 	if err := validateServiceID(serviceID); err != nil {
 		return ServiceView{}, err
@@ -169,6 +180,7 @@ func (m *Manager) Delete(ctx context.Context, serviceID string) (ServiceView, er
 	return m.getAfterOperation(serviceID)
 }
 
+// Get returns one service and its current and latest revision state.
 func (m *Manager) Get(ctx context.Context, serviceID string) (ServiceView, error) {
 	if err := validateServiceID(serviceID); err != nil {
 		return ServiceView{}, err
@@ -176,6 +188,7 @@ func (m *Manager) Get(ctx context.Context, serviceID string) (ServiceView, error
 	return m.get(ctx, serviceID)
 }
 
+// List returns all services ordered by service ID.
 func (m *Manager) List(ctx context.Context) ([]ServiceView, error) {
 	services, err := m.registry.List(ctx)
 	if err != nil {
@@ -192,6 +205,7 @@ func (m *Manager) List(ctx context.Context) ([]ServiceView, error) {
 	return views, nil
 }
 
+// ServiceHealth runs the current revision's optional direct HTTP health probe.
 func (m *Manager) ServiceHealth(ctx context.Context, serviceID string) (ServiceHealthView, error) {
 	if err := validateServiceID(serviceID); err != nil {
 		return ServiceHealthView{}, err
@@ -241,6 +255,7 @@ func (m *Manager) ServiceHealth(ctx context.Context, serviceID string) (ServiceH
 	return view, nil
 }
 
+// Reconcile restores current Workers and resumes interrupted revision switches after startup.
 func (m *Manager) Reconcile(ctx context.Context) error {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
@@ -336,10 +351,12 @@ func (m *Manager) restoreCurrent(ctx context.Context, services []registry.Servic
 	return reconcileErrors
 }
 
+// Health checks SQLite and Temporal Frontend connectivity.
 func (m *Manager) Health(ctx context.Context) error {
 	return errors.Join(m.registry.Ping(ctx), m.runtime.Ping(ctx))
 }
 
+// Close concurrently drains and stops every managed Worker.
 func (m *Manager) Close() {
 	m.opMu.Lock()
 	if m.closed {

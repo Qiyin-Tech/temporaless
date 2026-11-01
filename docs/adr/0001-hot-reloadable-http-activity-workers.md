@@ -28,7 +28,7 @@ Serverless Workers 强制使用 Worker Deployment Versioning，其中可复用�
 
 一个配置 revision 启动一个 Activity-only Worker。Worker 必须设置 `DisableWorkflowWorker: true`，使用相同的稳定 Task Queue 和 Activity Type，并通过 `DeploymentOptions` 报告 Deployment Name 与 Build ID。不同 revision 的 Activity closure 捕获各自不可变的 HTTP action、endpoint、schema 和 timeout。
 
-调用方始终调度 `{service_id}/invoke` 到 `{service_id}`，不感知 revision。
+调用方始终通过所用语言的官方 Temporal SDK，把一个语言无关的 JSON 对象调度为 `{service_id}/invoke` 到 `{service_id}`，不感知 revision，也不依赖 temporaless 客户端库。REST 管理面只使用普通 HTTP。
 
 ### 2. 使用 Worker Deployment Versioning 路由 revision
 
@@ -140,6 +140,8 @@ Activity Type、Task Queue、Deployment Name 和 Build ID 均由 `service_id/rev
 - `GET /services/{id}/health`：执行当前 revision 配置的可选 HTTP health 探针并记录 latency。
 - `DELETE /services/{id}`：热删除。
 - `GET /healthz`：检查进程、SQLite 和 Temporal 连接。
+- `GET /openapi.yaml`：OpenAPI 3.1 规范。
+- `GET /docs`：Swagger UI。
 
 管理 API 与 Activity Task Queue 是两个边界：REST API 管理配置并执行显式 health 探针，不代理业务请求或复用 Activity payload。
 
@@ -181,6 +183,8 @@ SQLite Registry ◄──► Reconciler / Worker Manager
 ```
 
 所有 Worker 共享一个 Temporal client 和一个 HTTP client；每个 revision 只有 Worker、注册的 Activity closure 和本地 in-flight 计数是独立的。
+
+进程配置来自可选 YAML 文件；省略 `-config` 时使用内建默认值。YAML 只负责 Gateway 进程、SQLite、Temporal、Worker 和共享 HTTP client 参数，动态 ServiceSpec 仍通过 REST JSON 管理。
 
 同一进程内的管理面变更由 Manager 串行执行，确保同一服务的 PUT、DELETE 和 revision 切换具有全序；Activity 执行不经过该锁，可由 Temporal Worker 并发调度。首版的全局管理锁也会串行不同服务的更新；等待时间包括前序请求排队、切流和旧 Worker 排空，但不会阻塞已经运行的 Activity。关闭时所有 Worker 同时开始 graceful Stop，避免按服务数串行累加排空时间。
 

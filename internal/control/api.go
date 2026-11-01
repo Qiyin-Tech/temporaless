@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +18,31 @@ import (
 
 const maxServiceSpecBytes = 4 << 20
 
+//go:embed openapi.yaml
+var openAPISpec []byte
+
+const swaggerUI = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>temporaless Control API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>SwaggerUIBundle({url: "/openapi.yaml", dom_id: "#swagger-ui"})</script>
+</body>
+</html>`
+
+// API exposes the REST control plane, OpenAPI document, and Swagger UI.
 type API struct {
 	manager *Manager
 	logger  *slog.Logger
 	mux     *http.ServeMux
 }
 
+// NewAPI builds the complete REST control-plane handler.
 func NewAPI(manager *Manager, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
@@ -34,9 +54,23 @@ func NewAPI(manager *Manager, logger *slog.Logger) http.Handler {
 	api.mux.HandleFunc("GET /services/{id}", api.getService)
 	api.mux.HandleFunc("DELETE /services/{id}", api.deleteService)
 	api.mux.HandleFunc("GET /healthz", api.health)
+	api.mux.HandleFunc("GET /openapi.yaml", api.openAPI)
+	api.mux.HandleFunc("GET /docs", api.swagger)
+	api.mux.HandleFunc("GET /docs/", api.swagger)
 	return api
 }
 
+func (a *API) openAPI(response http.ResponseWriter, _ *http.Request) {
+	response.Header().Set("Content-Type", "application/yaml")
+	_, _ = response.Write(openAPISpec)
+}
+
+func (a *API) swagger(response http.ResponseWriter, _ *http.Request) {
+	response.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(response, swaggerUI)
+}
+
+// ServeHTTP dispatches a control-plane request through the method-aware mux.
 func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	a.mux.ServeHTTP(response, request)
 }

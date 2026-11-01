@@ -64,10 +64,7 @@ curl -i http://127.0.0.1:18080/health
 
 ```bash
 go run ./cmd/temporaless \
-  -listen 127.0.0.1:8080 \
-  -db /tmp/temporaless-quickstart.db \
-  -temporal-address localhost:7233 \
-  -temporal-namespace default
+  -config temporaless.example.yaml
 ```
 
 看到下面的日志表示管理 API 已启动：
@@ -75,6 +72,11 @@ go run ./cmd/temporaless \
 ```text
 control API listening address=127.0.0.1:8080
 ```
+
+REST 契约可以直接查看：
+
+- Swagger UI：<http://127.0.0.1:8080/docs>
+- OpenAPI YAML：<http://127.0.0.1:8080/openapi.yaml>
 
 ## 4. 注册 HTTP 服务
 
@@ -188,7 +190,7 @@ status=200 message="OK" content_type="application/json"
 body={"job_id":"quickstart-...","output":"generated: a small robot playing piano","status":"completed"}
 ```
 
-真实的下游 Temporal 调用在 [examples/caller/main.go](../examples/caller/main.go) 中，核心部分是：
+真实的下游 Temporal 调用在 [examples/caller/main.go](../examples/caller/main.go) 中。它只导入官方 `go.temporal.io/sdk`，在调用方本地声明 JSON DTO，不依赖 `temporaless` module。核心部分是：
 
 ```go
 ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
@@ -199,7 +201,7 @@ ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
     WaitForCancellation:    true,
 })
 
-var response temporaless.Response
+var response gatewayResponse
 err := workflow.ExecuteActivity(
     ctx,
     input.ServiceID+"/invoke",
@@ -208,6 +210,31 @@ err := workflow.ExecuteActivity(
 ```
 
 调用方只使用稳定的 service ID，不读取 SQLite revision，也不拼接 Build ID。
+
+### 其他语言调用
+
+任何官方 Temporal SDK 都可以调用，只需把一个 JSON 对象作为唯一 Activity 参数调度到正确 Task Queue：
+
+```json
+{
+  "action": "invoke",
+  "headers": {
+    "Authorization": ["Bearer demo-token"],
+    "Content-Type": ["application/json"],
+    "Idempotency-Key": ["op-123"]
+  },
+  "body": "eyJwcm9tcHQiOiJoZWxsbyJ9"
+}
+```
+
+- Activity Type：`demo-service/invoke`
+- Task Queue：`demo-service`
+- Activity 参数个数：一个 JSON object
+- `headers`：`string -> string[]`
+- `body`：原始 HTTP bytes 的标准 Base64；示例值解码后是 `{"prompt":"hello"}`
+- `job_id`：只有 endpoint 使用 `{job_id}` 时才需要
+
+响应也是 JSON object，`body` 同样是 Base64。各语言只需要官方 SDK 的 JSON Payload Converter 和标准 Base64/HTTP 库。
 
 ## 7. 在 Temporal UI 中确认链路
 
@@ -252,10 +279,10 @@ curl --fail-with-body \
 
 ### Activity 一直重试
 
-网络错误和超时是 Activity failure，会按调用方配置的 Retry Policy 重试。HTTP 4xx/5xx 是正常的 `temporaless.Response`，不会自动转成 Activity failure。
+网络错误和超时是 Activity failure，会按调用方配置的 Retry Policy 重试。HTTP 4xx/5xx 是正常的 Gateway JSON response，不会自动转成 Activity failure。
 
 ### 响应过大
 
-后端响应体默认限制为 1 MiB，超限返回 non-retryable `ResponseTooLarge`。可用 `-max-backend-response-bytes` 调整，但大对象更适合返回对象存储引用。
+后端响应体默认限制为 1 MiB，超限返回 non-retryable `ResponseTooLarge`。可在 YAML 中调整 `http.max_backend_response_bytes`，但大对象更适合返回对象存储引用。
 
 完整字段和状态码见 [REST 与 Temporal API](api.md)。架构和失败恢复语义见 [ADR-0001](adr/0001-hot-reloadable-http-activity-workers.md)。

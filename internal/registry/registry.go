@@ -11,35 +11,51 @@ import (
 )
 
 var (
-	ErrNotFound     = errors.New("service not found")
+	// ErrNotFound reports that a requested service or revision does not exist.
+	ErrNotFound = errors.New("service not found")
+	// ErrInvalidState reports an invalid revision state transition.
 	ErrInvalidState = errors.New("invalid revision state")
 )
 
+// ServiceState is the persisted lifecycle state of a logical service.
 type ServiceState string
 
 const (
+	// ServiceStarting means the first revision has not become current.
 	ServiceStarting ServiceState = "starting"
+	// ServiceActive means the current revision is a callable service revision.
 	ServiceActive   ServiceState = "active"
+	// ServiceDeleted means the current revision is a tombstone.
 	ServiceDeleted  ServiceState = "deleted"
+	// ServiceFailed means the first revision failed and no current revision exists.
 	ServiceFailed   ServiceState = "failed"
 )
 
+// RevisionKind distinguishes a callable service revision from a tombstone.
 type RevisionKind string
 
 const (
+	// KindService identifies a callable HTTP service revision.
 	KindService   RevisionKind = "service"
+	// KindTombstone identifies a revision that rejects new calls as deleted.
 	KindTombstone RevisionKind = "tombstone"
 )
 
+// RevisionState is the persisted lifecycle state of one immutable revision.
 type RevisionState string
 
 const (
+	// RevisionStarting means Worker startup or routing is still being reconciled.
 	RevisionStarting RevisionState = "starting"
+	// RevisionActive means Temporal routes new tasks to this revision.
 	RevisionActive   RevisionState = "active"
+	// RevisionDraining means a newer revision replaced this one.
 	RevisionDraining RevisionState = "draining"
+	// RevisionFailed means startup or routing was definitively rejected.
 	RevisionFailed   RevisionState = "failed"
 )
 
+// Revision is one immutable normalized service configuration and its state.
 type Revision struct {
 	ServiceID     string
 	Number        int64
@@ -52,6 +68,7 @@ type Revision struct {
 	UpdatedAt     time.Time
 }
 
+// Service combines the service row with its current and latest revisions.
 type Service struct {
 	ID              string
 	State           ServiceState
@@ -62,10 +79,12 @@ type Service struct {
 	UpdatedAt       time.Time
 }
 
+// Registry persists service configuration and revision history in SQLite.
 type Registry struct {
 	db *sql.DB
 }
 
+// Open opens or creates a SQLite Registry and runs its migrations.
 func Open(path string) (*Registry, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -82,14 +101,17 @@ func Open(path string) (*Registry, error) {
 	return registry, nil
 }
 
+// Close closes the SQLite connection.
 func (r *Registry) Close() error {
 	return r.db.Close()
 }
 
+// Ping checks SQLite connectivity.
 func (r *Registry) Ping(ctx context.Context) error {
 	return r.db.PingContext(ctx)
 }
 
+// Prepare creates a starting revision or reports an idempotent no-op.
 func (r *Registry) Prepare(ctx context.Context, serviceID string, kind RevisionKind, specJSON []byte, hash string) (Revision, bool, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -198,6 +220,7 @@ func insertStartingRevision(ctx context.Context, tx *sql.Tx, serviceID string, k
 	}, nil
 }
 
+// MarkSwitchStarted records that Temporal may have accepted the routing update.
 func (r *Registry) MarkSwitchStarted(ctx context.Context, serviceID string, number int64) error {
 	now := formatTime(time.Now().UTC())
 	result, err := r.db.ExecContext(ctx,
@@ -216,6 +239,7 @@ func (r *Registry) MarkSwitchStarted(ctx context.Context, serviceID string, numb
 	return nil
 }
 
+// Activate makes a revision current and marks the previous active revision draining.
 func (r *Registry) Activate(ctx context.Context, serviceID string, number int64) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -257,6 +281,7 @@ func activeServiceState(kind RevisionKind) ServiceState {
 	return ServiceActive
 }
 
+// MarkFailed records a definitive starting revision failure.
 func (r *Registry) MarkFailed(ctx context.Context, serviceID string, number int64) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -286,6 +311,7 @@ func (r *Registry) MarkFailed(ctx context.Context, serviceID string, number int6
 	return tx.Commit()
 }
 
+// Get returns one service with its current and latest revisions.
 func (r *Registry) Get(ctx context.Context, serviceID string) (Service, error) {
 	service, current, err := r.getServiceRow(ctx, serviceID)
 	if err != nil {
@@ -345,6 +371,7 @@ func (r *Registry) loadServiceRevisions(ctx context.Context, service *Service, c
 	return nil
 }
 
+// List returns all services with current and latest revisions using one joined query.
 func (r *Registry) List(ctx context.Context) ([]Service, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		WITH latest_revisions AS (
@@ -450,6 +477,7 @@ func (r joinedRevision) revision(serviceID string) (Revision, error) {
 	}, nil
 }
 
+// ListStarting returns revisions whose routing outcome still needs reconciliation.
 func (r *Registry) ListStarting(ctx context.Context) ([]Revision, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT service_id, revision, kind, state, switch_started, spec_json, config_hash, created_at, updated_at
@@ -470,6 +498,7 @@ func (r *Registry) ListStarting(ctx context.Context) ([]Revision, error) {
 	return revisions, rows.Err()
 }
 
+// GetRevision returns one revision by service ID and revision number.
 func (r *Registry) GetRevision(ctx context.Context, serviceID string, number int64) (Revision, error) {
 	return queryRevision(ctx, r.db, serviceID, number)
 }

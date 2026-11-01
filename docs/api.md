@@ -2,6 +2,11 @@
 
 本文档描述当前实现的公开契约。管理 API 默认监听 `http://127.0.0.1:8080`，所有时间使用 RFC 3339，duration 使用 Go duration 格式，例如 `500ms`、`10s`、`5m`。
 
+- OpenAPI 3.1：`GET /openapi.yaml`
+- Swagger UI：`GET /docs`
+
+Swagger UI 的静态资源来自 `unpkg.com`；OpenAPI YAML 内嵌在 binary 中，可以离线获取。
+
 ## REST 管理 API
 
 ### 通用规则
@@ -274,6 +279,8 @@ Revision state：
 
 ## Temporal Activity API
 
+调用方不依赖 temporaless 客户端库，只依赖所用语言的官方 Temporal SDK。服务注册、查询和删除使用本页描述的普通 REST API。
+
 调用方使用稳定名称：
 
 | 项目 | 值 |
@@ -283,10 +290,34 @@ Revision state：
 | Worker Deployment | `{service_id}` |
 | Build ID | `r{revision}`，只由 Gateway 管理 |
 
-Go 输入：
+Activity 接收一个 JSON 参数：
+
+```json
+{
+  "action": "invoke",
+  "headers": {
+    "Authorization": ["Bearer token"],
+    "Content-Type": ["application/json"],
+    "Idempotency-Key": ["op-123"]
+  },
+  "body": "eyJwcm9tcHQiOiJoZWxsbyJ9",
+  "job_id": "optional-job-id"
+}
+```
+
+语言无关字段：
+
+| 字段 | JSON 类型 | 说明 |
+|---|---|---|
+| `action` | string | 必须匹配 ServiceSpec 中的 action 名称 |
+| `headers` | object of string arrays | 端到端 HTTP header。hop-by-hop header 会被过滤 |
+| `body` | Base64 string | 原始 HTTP body bytes。示例解码后是 `{"prompt":"hello"}` |
+| `job_id` | string | endpoint 含 `{job_id}` 时必填，并按 path segment 转义 |
+
+Go 调用方可以在自己的代码中声明等价 DTO，`encoding/json` 会自动处理 `[]byte` 的 Base64：
 
 ```go
-type Request struct {
+type GatewayRequest struct {
     Action  string
     Headers http.Header
     Body    []byte
@@ -294,25 +325,31 @@ type Request struct {
 }
 ```
 
-字段：
+Activity 返回一个 JSON object：
 
-| 字段 | 说明 |
-|---|---|
-| `Action` | 必须匹配 ServiceSpec 中的 action 名称 |
-| `Headers` | 端到端 HTTP header。hop-by-hop header 会被过滤 |
-| `Body` | 原始 HTTP body。Gateway 不映射业务对象 |
-| `JobID` | endpoint 含 `{job_id}` 时必填，并按 path segment 转义 |
+```json
+{
+  "status": 200,
+  "message": "OK",
+  "headers": {
+    "Content-Type": ["application/json"]
+  },
+  "body": "eyJqb2JfaWQiOiJvcC0xMjMiLCJzdGF0dXMiOiJjb21wbGV0ZWQifQ=="
+}
+```
 
-Go 输出：
+等价 Go DTO：
 
 ```go
-type Response struct {
+type GatewayResponse struct {
     Status  int
     Message string
     Headers http.Header
     Body    []byte
 }
 ```
+
+其他语言应使用官方 SDK 的 JSON Payload Converter，把上述对象作为唯一 Activity 参数。不要传语言私有的二进制对象或自定义 codec，除非 Gateway Worker 配置了匹配的 Data Converter。
 
 HTTP 4xx 和 5xx 仍是正常 Activity 结果。调用方必须检查 `Response.Status`。以下情况是 Activity failure：
 
@@ -350,22 +387,62 @@ Gateway 周期性 heartbeat，使 Workflow cancellation 能传播到 Go context 
 
 完整可运行调用见 [examples/caller](../examples/caller/main.go)。
 
-## 进程参数
+## Gateway YAML 配置
 
-| 参数 | 默认值 | 说明 |
+启动命令只有一个可选参数：
+
+```bash
+temporaless -config /etc/temporaless/config.yaml
+```
+
+省略 `-config` 时使用以下内建默认值。仓库中的 [temporaless.example.yaml](../temporaless.example.yaml) 可直接用于 Quick Start，其中 `registry.path` 改为 `/tmp/temporaless-quickstart.db`，其余字段与默认值一致。
+
+```yaml
+server:
+  listen: 127.0.0.1:8080
+  read_header_timeout: 5s
+  read_timeout: 15s
+  idle_timeout: 1m
+  shutdown_timeout: 10s
+
+registry:
+  path: temporaless.db
+
+temporal:
+  address: localhost:7233
+  namespace: default
+  startup_timeout: 2m
+
+worker:
+  switch_timeout: 30s
+  stop_timeout: 30s
+  max_concurrent_activities_per_service: 32
+
+http:
+  max_backend_response_bytes: 1048576
+  max_idle_connections_per_host: 32
+```
+
+参数说明：
+
+| YAML path | 默认值 | 说明 |
 |---|---|---|
-| `-listen` | `127.0.0.1:8080` | 管理 API 监听地址 |
-| `-db` | `temporaless.db` | SQLite 文件路径，`:memory:` 表示内存库 |
-| `-temporal-address` | `localhost:7233` | Temporal Frontend 地址 |
-| `-temporal-namespace` | `default` | Temporal Namespace |
-| `-switch-timeout` | `30s` | revision 成为 Current 的最长操作时间 |
-| `-worker-stop-timeout` | `30s` | 旧 Worker 排空 in-flight Activity 的宽限时间 |
-| `-max-concurrent-activities-per-service` | `32` | 每个服务 Worker 的最大并发 Activity 数 |
-| `-max-backend-response-bytes` | `1048576` | 后端响应体上限 |
-| `-control-read-timeout` | `15s` | 管理 API 读取完整请求的最长时间 |
-| `-max-idle-connections-per-host` | `32` | 每个后端 host 保留的最大空闲连接数 |
+| `server.listen` | `127.0.0.1:8080` | REST、OpenAPI 和 Swagger UI 的监听地址 |
+| `server.read_header_timeout` | `5s` | 读取 HTTP request headers 的最长时间 |
+| `server.read_timeout` | `15s` | 读取完整管理请求的最长时间 |
+| `server.idle_timeout` | `1m` | keep-alive 空闲连接超时 |
+| `server.shutdown_timeout` | `10s` | 收到进程退出信号后等待 HTTP server 关闭的时间 |
+| `registry.path` | `temporaless.db` | SQLite 文件路径；`:memory:` 表示内存数据库 |
+| `temporal.address` | `localhost:7233` | Temporal Frontend 地址 |
+| `temporal.namespace` | `default` | Gateway Workers 所在 Namespace |
+| `temporal.startup_timeout` | `2m` | 启动 reconcile 的总 deadline |
+| `worker.switch_timeout` | `30s` | 单次 revision Current Version 切换 deadline |
+| `worker.stop_timeout` | `30s` | 旧 Worker 排空 in-flight Activity 的宽限时间 |
+| `worker.max_concurrent_activities_per_service` | `32` | 每个服务 Worker 的 Activity 并发上限 |
+| `http.max_backend_response_bytes` | `1048576` | 读入内存并返回 Temporal 的最大后端响应体 bytes |
+| `http.max_idle_connections_per_host` | `32` | 共享 HTTP Transport 每个 host 保留的最大空闲连接数 |
 
-`max-concurrent-activities-per-service`、`max-backend-response-bytes`、`control-read-timeout` 和 `max-idle-connections-per-host` 必须为正数。
+YAML 支持只写需要覆盖的字段，其他字段保留默认值。未知字段、多个 YAML document、空地址、非正 duration 和非正数值都会导致进程在启动前报错。
 
 ## 安全边界
 

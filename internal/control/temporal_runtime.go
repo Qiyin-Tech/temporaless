@@ -16,12 +16,14 @@ const (
 	defaultMaxConcurrentActivities = 32
 )
 
+// TemporalRuntime implements Runtime with Temporal Worker Deployment Versioning.
 type TemporalRuntime struct {
 	client                  client.Client
 	stopTimeout             time.Duration
 	maxConcurrentActivities int
 }
 
+// NewTemporalRuntime creates an Activity-only Worker runtime sharing one Temporal client.
 func NewTemporalRuntime(temporalClient client.Client, stopTimeout time.Duration, maxConcurrentActivities int) *TemporalRuntime {
 	if stopTimeout <= 0 {
 		stopTimeout = 30 * time.Second
@@ -36,6 +38,7 @@ func NewTemporalRuntime(temporalClient client.Client, stopTimeout time.Duration,
 	}
 }
 
+// Start starts one versioned Activity Worker for a service revision.
 func (r *TemporalRuntime) Start(serviceID string, buildID string, activityFn Activity) (Worker, error) {
 	activityWorker := worker.New(r.client, serviceID, worker.Options{
 		DisableWorkflowWorker:              true,
@@ -93,6 +96,7 @@ func heartbeatInterval(timeout time.Duration) time.Duration {
 	return activityHeartbeatInterval
 }
 
+// SetCurrent routes new service tasks to buildID.
 func (r *TemporalRuntime) SetCurrent(ctx context.Context, serviceID string, buildID string) error {
 	_, err := r.client.WorkerDeploymentClient().GetHandle(serviceID).SetCurrentVersion(ctx, client.WorkerDeploymentSetCurrentVersionOptions{
 		BuildID: buildID,
@@ -100,6 +104,7 @@ func (r *TemporalRuntime) SetCurrent(ctx context.Context, serviceID string, buil
 	return err
 }
 
+// Current returns the service Worker Deployment's current Build ID.
 func (r *TemporalRuntime) Current(ctx context.Context, serviceID string) (string, error) {
 	description, err := r.client.WorkerDeploymentClient().GetHandle(serviceID).Describe(ctx, client.WorkerDeploymentDescribeOptions{})
 	if err != nil {
@@ -115,6 +120,7 @@ func currentBuildID(description client.WorkerDeploymentDescribeResponse) string 
 	return description.Info.RoutingConfig.CurrentVersion.BuildID
 }
 
+// Ping checks Temporal Frontend connectivity.
 func (r *TemporalRuntime) Ping(ctx context.Context) error {
 	_, err := r.client.CheckHealth(ctx, nil)
 	return err

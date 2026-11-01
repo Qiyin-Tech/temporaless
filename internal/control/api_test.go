@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"temporaless/internal/registry"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestAPIServiceLifecycle(t *testing.T) {
@@ -177,6 +179,33 @@ func TestAPIHealth(t *testing.T) {
 	response := request(t, handler, http.MethodGet, "/healthz", "")
 	if response.Code != http.StatusOK || response.Body.String() != "{\"status\":\"ok\"}\n" {
 		t.Fatalf("health = %d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestAPIDocumentation(t *testing.T) {
+	t.Parallel()
+
+	handler := NewAPI(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	openAPI := request(t, handler, http.MethodGet, "/openapi.yaml", "")
+	if openAPI.Code != http.StatusOK || openAPI.Header().Get("Content-Type") != "application/yaml" || !strings.Contains(openAPI.Body.String(), "openapi: 3.1.0") {
+		t.Fatalf("OpenAPI response = %d %q", openAPI.Code, openAPI.Body.String())
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal(openAPI.Body.Bytes(), &document); err != nil {
+		t.Fatalf("decode OpenAPI: %v", err)
+	}
+	paths, ok := document["paths"].(map[string]any)
+	if !ok {
+		t.Fatalf("OpenAPI paths = %#v", document["paths"])
+	}
+	for _, path := range []string{"/services", "/services/{id}", "/services/{id}/health", "/healthz"} {
+		if _, ok := paths[path]; !ok {
+			t.Errorf("OpenAPI missing path %s", path)
+		}
+	}
+	swagger := request(t, handler, http.MethodGet, "/docs", "")
+	if swagger.Code != http.StatusOK || !strings.Contains(swagger.Body.String(), "SwaggerUIBundle") {
+		t.Fatalf("Swagger response = %d %q", swagger.Code, swagger.Body.String())
 	}
 }
 

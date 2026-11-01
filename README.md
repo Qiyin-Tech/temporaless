@@ -30,7 +30,7 @@ go run ./examples/backend
 
 ```bash
 go run ./cmd/temporaless \
-  -db /tmp/temporaless-quickstart.db
+  -config temporaless.example.yaml
 ```
 
 注册服务：
@@ -69,28 +69,30 @@ go run ./examples/caller
 
 逐步说明、完整 schema 和预期输出见 [Quick Start](docs/quickstart.md)。
 
-## 稳定的 Temporal 契约
+## 稳定且语言无关的 Temporal 契约
 
 调用方始终使用：
 
 - Activity Type：`{service_id}/invoke`
 - Task Queue：`{service_id}`
 
-Go payload：
+调用方只依赖所用语言的官方 Temporal SDK。注册和管理服务使用普通 HTTP，不需要导入 `temporaless` Go module 或任何专用客户端。
 
-```go
-temporaless.Request{
-    Action: "invoke",
-    Headers: http.Header{
-        "Authorization":   {"Bearer ..."},
-        "Content-Type":    {"application/json"},
-        "Idempotency-Key": {operationID},
-    },
-    Body: []byte(`{"prompt":"hello"}`),
+Activity 参数是一个 JSON 对象。`body` 是原始 HTTP body 的 Base64：
+
+```json
+{
+  "action": "invoke",
+  "headers": {
+    "Authorization": ["Bearer ..."],
+    "Content-Type": ["application/json"],
+    "Idempotency-Key": ["op-123"]
+  },
+  "body": "eyJwcm9tcHQiOiJoZWxsbyJ9"
 }
 ```
 
-响应是 `temporaless.Response`，包含 `Status`、`Message`、`Headers` 和 `Body`。Gateway 保持 HTTP 对象语义，不映射业务对象；redirect、gzip 和 framing 仍按 Go `net/http` 行为处理。
+Go 示例在调用方本地声明等价 struct，其他语言直接构造同一 JSON 对象。响应包含 `status`、`message`、`headers` 和 Base64 `body`。Gateway 保持 HTTP 对象语义，不映射业务对象；redirect、gzip 和 framing 仍按 Go `net/http` 行为处理。
 
 HTTP 4xx/5xx 是正常 Activity 结果。DNS、连接错误和 timeout 是 Activity failure，由调用方 Retry Policy 决定是否重试。Gateway 发送 Activity heartbeat，使 Workflow cancellation 能取消正在进行的 HTTP request。
 
@@ -106,6 +108,8 @@ HTTP 4xx/5xx 是正常 Activity 结果。DNS、连接错误和 timeout 是 Activ
 | `GET` | `/services/{id}/health` | 调用可选的后端 health endpoint 并记录 latency |
 | `DELETE` | `/services/{id}` | 切换到 tombstone revision |
 | `GET` | `/healthz` | 检查 SQLite 和 Temporal 连接 |
+| `GET` | `/openapi.yaml` | OpenAPI 3.1 规范 |
+| `GET` | `/docs` | Swagger UI |
 
 完整请求、响应、状态码和配置字段见 [REST 与 Temporal API](docs/api.md)。
 
@@ -120,24 +124,15 @@ HTTP 4xx/5xx 是正常 Activity 结果。DNS、连接错误和 timeout 是 Activ
 
 `DELETE` 创建 tombstone revision。之后错误调度到稳定 Task Queue 的新 Activity 会快速得到 non-retryable `ServiceDeleted`，不会永久等待没有 Worker 的队列。重新 `PUT` 相同 service ID 可以恢复服务。
 
-## 运行参数
+## YAML 配置
 
-常用参数及默认值：
+Gateway 只保留一个启动参数：
 
-```text
--listen                                  127.0.0.1:8080
--db                                      temporaless.db
--temporal-address                        localhost:7233
--temporal-namespace                      default
--switch-timeout                          30s
--worker-stop-timeout                     30s
--max-concurrent-activities-per-service   32
--max-backend-response-bytes              1048576
--control-read-timeout                    15s
--max-idle-connections-per-host           32
+```bash
+go run ./cmd/temporaless -config temporaless.example.yaml
 ```
 
-详细语义见 [进程参数](docs/api.md#进程参数)。
+省略 `-config` 时使用内建默认值。完整 YAML 和每个参数的默认值、单位与作用见 [Gateway YAML 配置](docs/api.md#gateway-yaml-配置)。
 
 ## 验证
 
