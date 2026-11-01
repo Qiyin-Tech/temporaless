@@ -134,6 +134,44 @@ go run ./cmd/temporaless -config temporaless.example.yaml
 
 省略 `-config` 时使用内建默认值。完整 YAML 和每个参数的默认值、单位与作用见 [Gateway YAML 配置](docs/api.md#gateway-yaml-配置)。
 
+## Docker
+
+CI 会将 Linux amd64 镜像发布到 GHCR。默认分支使用 `latest`，分支、Git tag、SemVer 和 commit 另有独立 tag：
+
+```bash
+docker pull ghcr.io/qiyin-tech/temporaless:latest
+```
+
+仓库关联的 GitHub Actions 使用 `GITHUB_TOKEN` 发布，无需额外 registry secret；部署侧使用组织级 GHCR 权限拉取私有镜像。本地构建命令为：
+
+```bash
+docker buildx build --platform linux/amd64 --load -t temporaless:dev .
+```
+
+容器不内置环境配置。复制 `temporaless.example.yaml` 为 `temporaless.docker.yaml`，至少修改以下字段：
+
+```yaml
+server:
+  listen: 0.0.0.0:8080
+registry:
+  path: /var/lib/temporaless/temporaless.db
+temporal:
+  address: host.docker.internal:7233
+```
+
+其余字段继续沿用示例值，然后将 YAML 只读挂载到固定路径，将 SQLite 目录挂到持久卷：
+
+```bash
+docker run --rm --name temporaless \
+  --add-host host.docker.internal:host-gateway \
+  -p 8080:8080 \
+  --mount type=bind,src="$PWD/temporaless.docker.yaml",dst=/etc/temporaless/config.yaml,readonly \
+  --mount type=volume,src=temporaless-data,dst=/var/lib/temporaless \
+  ghcr.io/qiyin-tech/temporaless:latest
+```
+
+`host.docker.internal` 仅用于本机 Docker；部署时应改成容器网络可达的 Temporal Frontend 地址。配置文件必须对容器 UID `65532` 可读；数据卷由镜像预设为该 UID 可写。配置不通过 build argument、环境变量或镜像层注入，避免环境信息和未来可能出现的凭据进入镜像历史。
+
 ## 验证
 
 ```bash
