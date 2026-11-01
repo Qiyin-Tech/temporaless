@@ -542,11 +542,12 @@ func TestManagerRetriesWorkerRegistrationRace(t *testing.T) {
 
 func TestManagerClassifiesSwitchTimeout(t *testing.T) {
 	t.Parallel()
+	const switchTimeout = 250 * time.Millisecond
 
 	t.Run("known rejection marks revision failed", func(t *testing.T) {
 		store := openRegistry(t)
 		runtime := &fakeRuntime{activities: make(map[string]Activity), setError: serviceerror.NewNotFound("not registered")}
-		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: 10 * time.Millisecond, RetryInterval: time.Millisecond})
+		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: switchTimeout, RetryInterval: time.Millisecond})
 		t.Cleanup(manager.Close)
 		if _, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com")); err == nil {
 			t.Fatal("put succeeded")
@@ -564,7 +565,7 @@ func TestManagerClassifiesSwitchTimeout(t *testing.T) {
 			setError:     serviceerror.NewNotFound("not registered"),
 			currentError: errors.New("Temporal unavailable"),
 		}
-		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: 10 * time.Millisecond, RetryInterval: time.Millisecond})
+		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: switchTimeout, RetryInterval: time.Millisecond})
 		t.Cleanup(manager.Close)
 		if _, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com")); err == nil {
 			t.Fatal("put succeeded")
@@ -591,7 +592,7 @@ func TestManagerClassifiesSwitchTimeout(t *testing.T) {
 			setError:   serviceerror.NewNotFound("response lost"),
 			current:    "r1",
 		}
-		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: 10 * time.Millisecond, RetryInterval: time.Millisecond})
+		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: switchTimeout, RetryInterval: time.Millisecond})
 		t.Cleanup(manager.Close)
 		service, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com"))
 		if err != nil || service.CurrentRevision != 1 {
@@ -606,7 +607,7 @@ func TestManagerClassifiesSwitchTimeout(t *testing.T) {
 			setError:     serviceerror.NewNotFound("response lost"),
 			currentError: errors.New("Temporal unavailable"),
 		}
-		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: 10 * time.Millisecond, RetryInterval: time.Millisecond})
+		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: switchTimeout, RetryInterval: time.Millisecond})
 		t.Cleanup(manager.Close)
 		if _, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com")); err == nil {
 			t.Fatal("first put succeeded")
@@ -624,7 +625,7 @@ func TestManagerClassifiesSwitchTimeout(t *testing.T) {
 	t.Run("old observation cannot reject a late switch", func(t *testing.T) {
 		store := activeServiceWithStartingUpdate(t)
 		runtime := newDelayedSwitchRuntime()
-		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: 10 * time.Millisecond, RetryInterval: time.Millisecond})
+		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: switchTimeout, RetryInterval: time.Millisecond})
 		t.Cleanup(manager.Close)
 
 		if _, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com/v2")); err == nil {
@@ -673,7 +674,7 @@ func TestManagerClassifiesSwitchTimeout(t *testing.T) {
 			setErrors:  []error{serviceerror.NewDeadlineExceeded("response lost")},
 			setError:   serviceerror.NewNotFound("rejected retry"),
 		}
-		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: 10 * time.Millisecond, RetryInterval: time.Millisecond})
+		manager := NewManager(store, runtime, http.DefaultClient, ManagerOptions{SwitchTimeout: switchTimeout, RetryInterval: time.Millisecond})
 		t.Cleanup(manager.Close)
 
 		if _, err := manager.Put(context.Background(), "service-a", serviceSpec("https://example.com")); err == nil {
