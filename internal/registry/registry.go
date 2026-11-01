@@ -41,14 +41,15 @@ const (
 )
 
 type Revision struct {
-	ServiceID string
-	Number    int64
-	Kind      RevisionKind
-	State     RevisionState
-	SpecJSON  []byte
-	Hash      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ServiceID     string
+	Number        int64
+	Kind          RevisionKind
+	State         RevisionState
+	SwitchStarted bool
+	SpecJSON      []byte
+	Hash          string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 type Service struct {
@@ -180,8 +181,8 @@ func insertStartingRevision(ctx context.Context, tx *sql.Tx, serviceID string, k
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO service_revisions
-			(service_id, revision, kind, state, spec_json, config_hash, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			(service_id, revision, kind, state, switch_started, spec_json, config_hash, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`,
 		serviceID, number, kind, RevisionStarting, specJSON, hash, formatTime(now), formatTime(now)); err != nil {
 		return Revision{}, err
 	}
@@ -195,6 +196,24 @@ func insertStartingRevision(ctx context.Context, tx *sql.Tx, serviceID string, k
 		CreatedAt: now,
 		UpdatedAt: now,
 	}, nil
+}
+
+func (r *Registry) MarkSwitchStarted(ctx context.Context, serviceID string, number int64) error {
+	now := formatTime(time.Now().UTC())
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE service_revisions SET switch_started = 1, updated_at = ? WHERE service_id = ? AND revision = ? AND state = ?`,
+		now, serviceID, number, RevisionStarting)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return ErrInvalidState
+	}
+	return nil
 }
 
 func (r *Registry) Activate(ctx context.Context, serviceID string, number int64) error {
@@ -360,7 +379,7 @@ func (r *Registry) List(ctx context.Context) ([]Service, error) {
 
 func (r *Registry) ListStarting(ctx context.Context) ([]Revision, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT service_id, revision, kind, state, spec_json, config_hash, created_at, updated_at
+		SELECT service_id, revision, kind, state, switch_started, spec_json, config_hash, created_at, updated_at
 		FROM service_revisions WHERE state = ? ORDER BY service_id, revision`, RevisionStarting)
 	if err != nil {
 		return nil, err
@@ -399,6 +418,7 @@ func (r *Registry) migrate(ctx context.Context) error {
 			revision INTEGER NOT NULL,
 			kind TEXT NOT NULL CHECK (kind IN ('service', 'tombstone')),
 			state TEXT NOT NULL CHECK (state IN ('starting', 'active', 'draining', 'failed')),
+			switch_started INTEGER NOT NULL DEFAULT 0 CHECK (switch_started IN (0, 1)),
 			spec_json BLOB,
 			config_hash TEXT NOT NULL,
 			created_at TEXT NOT NULL,
@@ -407,7 +427,40 @@ func (r *Registry) migrate(ctx context.Context) error {
 		);
 		CREATE INDEX IF NOT EXISTS service_revisions_state ON service_revisions(state);
 	`)
+	if err != nil {
+		return err
+	}
+	hasSwitchStarted, err := r.hasColumn(ctx, "service_revisions", "switch_started")
+	if err != nil || hasSwitchStarted {
+		return err
+	}
+	if _, err := r.db.ExecContext(ctx, `ALTER TABLE service_revisions ADD COLUMN switch_started INTEGER NOT NULL DEFAULT 0 CHECK (switch_started IN (0, 1))`); err != nil {
+		return err
+	}
+	// Existing starting rows may already have an in-flight Temporal update.
+	_, err = r.db.ExecContext(ctx, `UPDATE service_revisions SET switch_started = 1 WHERE state = ?`, RevisionStarting)
 	return err
+}
+
+func (r *Registry) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	rows, err := r.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 type scanner interface {
@@ -418,18 +471,20 @@ func queryRevision(ctx context.Context, queryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, serviceID string, number int64) (Revision, error) {
 	return scanRevision(queryer.QueryRowContext(ctx, `
-		SELECT service_id, revision, kind, state, spec_json, config_hash, created_at, updated_at
+		SELECT service_id, revision, kind, state, switch_started, spec_json, config_hash, created_at, updated_at
 		FROM service_revisions WHERE service_id = ? AND revision = ?`, serviceID, number))
 }
 
 func scanRevision(row scanner) (Revision, error) {
 	var revision Revision
+	var switchStarted int
 	var createdAt, updatedAt string
 	if err := row.Scan(
 		&revision.ServiceID,
 		&revision.Number,
 		&revision.Kind,
 		&revision.State,
+		&switchStarted,
 		&revision.SpecJSON,
 		&revision.Hash,
 		&createdAt,
@@ -440,6 +495,7 @@ func scanRevision(row scanner) (Revision, error) {
 		}
 		return Revision{}, err
 	}
+	revision.SwitchStarted = switchStarted != 0
 	var err error
 	revision.CreatedAt, err = parseTime(createdAt)
 	if err != nil {

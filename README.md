@@ -72,7 +72,9 @@ temporaless.Request{
 }
 ```
 
-响应的 HTTP status、header 和 body 原样放在 `temporaless.Response` 中。4xx/5xx 是正常 Activity 结果；网络错误、连接错误和超时才是 Activity failure。配置 schema 时，仅对 JSON body 的副本做校验，发送和返回的字节不会被重新编码。
+响应使用 Go `net/http` 暴露的 status、header 和 body 构造 `temporaless.Response`。Gateway 不解析或重组业务对象；4xx/5xx 是正常 Activity 结果，网络错误、连接错误和超时才是 Activity failure。配置 schema 时，仅对 JSON body 的副本做校验。这里承诺的是 HTTP 对象语义透明，不是 wire bytes 透明：redirect、gzip 解压和 framing 等仍按 `net/http` 标准行为处理。
+
+Gateway 会在持续执行的 HTTP Activity 中发送空 heartbeat，使 Workflow cancellation 能取消 Activity context 和正在进行的 HTTP request。调用 Workflow 应按期望的取消延迟设置 `HeartbeatTimeout`；只有需要等待 HTTP 调用实际退出时才设置 `WaitForCancellation: true`，默认值 `false` 只发出取消请求而不等待确认。
 
 ## 验证
 
@@ -81,6 +83,6 @@ go test ./...
 TEMPORAL_SMOKE=1 go test ./...
 ```
 
-第二条命令需要 `localhost:7233` 上运行 Temporal，覆盖 Worker Deployment backlog、并发 in-flight Activity 排空以及完整的 r1 → r2 → tombstone 调用链。
+第二条命令需要 `localhost:7233` 上运行 Temporal，覆盖 Worker Deployment backlog、并发 in-flight Activity 排空、Activity heartbeat 取消传播以及完整的 r1 → r2 → tombstone 调用链。
 
 架构与失败语义见 [ADR-0001](docs/adr/0001-hot-reloadable-http-activity-workers.md)。

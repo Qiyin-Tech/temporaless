@@ -5,7 +5,7 @@
 
 ## 背景
 
-本项目提供一个 Go Gateway，作为 Temporal Worker 调用 Runpod、阿里云函数计算等 HTTP 服务。它需要通过 REST API 动态新增、更新和删除服务，并在不改写 body 的前提下转发请求和响应。后端负责鉴权与幂等，Gateway 只透传相应 header。
+本项目提供一个 Go Gateway，作为 Temporal Worker 调用 Runpod、阿里云函数计算等 HTTP 服务。它需要通过 REST API 动态新增、更新和删除服务，并在不解释业务 payload 的前提下转发请求和响应。后端负责鉴权与幂等，Gateway 只透传相应 header。
 
 首版运行在单个长驻进程中，Temporal Server 为本地 1.32.0，Registry 使用 SQLite。
 
@@ -36,11 +36,12 @@ Serverless Workers 强制使用 Worker Deployment Versioning，其中可复用�
 
 1. 在 SQLite 写入 `starting` revision。
 2. 启动 `Build ID = rN` 的 Worker；`SetCurrentVersion` 默认拒绝从未出现过 poller 的版本，因此直接复用 Temporal 的就绪保护。
-3. 将该 Worker Deployment Version 设置为 Current Version。
-4. 在 SQLite 中将新 revision 标记为 `active`，旧 revision 标记为 `draining`。
-5. 调用旧 Worker 的 graceful `Stop`：停止新 poll，并在 `WorkerStopTimeout` 内等待已经开始的 Activity 完成。
+3. 在 SQLite 持久化 `switch_started = true`，表示之后可能存在仍在服务端完成的切流操作。
+4. 将该 Worker Deployment Version 设置为 Current Version。
+5. 在 SQLite 中将新 revision 标记为 `active`，旧 revision 标记为 `draining`。
+6. 调用旧 Worker 的 graceful `Stop`：停止新 poll，并在 `WorkerStopTimeout` 内等待已经开始的 Activity 完成。
 
-新 Worker 启动失败或 Temporal 明确拒绝切流时，Current Version 保持不变，新 revision 标记为 `failed`。每次判定切流失败前都读取 Temporal Current Version，避免把上一次未知结果但实际成功的切流误标为失败。若无法读取 Current Version，结果属于未知状态：保留 `starting` revision 和新旧 Worker，不强制写回 SQLite 中的旧版本，避免把已经成功的切流回滚。启动 reconcile 会先预热 SQLite 记录的当前 Worker，再恢复未完成 revision；已经可靠落成 `failed` 的单服务 revision 不阻止其他服务启动，未知路由或无法恢复当前版本仍作为进程级错误。进程在任一步骤崩溃后，以 Temporal 当前路由和 SQLite revision 记录继续收敛。
+新 Worker 启动失败或 Temporal 明确拒绝且没有更早的未决切流时，Current Version 保持不变，新 revision 标记为 `failed`。RPC 超时、连接中断以及它们之后观察到的旧 Current 都不能证明切流失败：服务端可能仍在完成已接受的 Worker Deployment Update。此时保留 `starting` revision、`switch_started` 和新旧 Worker，不强制写回 SQLite 中的旧版本。启动 reconcile 会先预热 SQLite 记录的当前 Worker，再恢复未完成 revision；已成功替换旧 Current 时忽略旧版本的预热错误。已经可靠落成 `failed` 的单服务 revision 不阻止其他服务启动，未知路由或无法恢复当前版本仍作为进程级错误。进程在任一步骤崩溃后，以 Temporal 当前路由和 SQLite revision 记录继续收敛。
 
 因此不再引入 `resolve-service` Activity，也不创建 `{service_id}/rN` Task Queue。Temporal 对独立 Activity 按其 Task Queue 的 Current/Ramping Version 路由，避免应用层“先解析 revision、后调度 Activity”的竞态。
 
@@ -74,7 +75,7 @@ Serverless Workers 强制使用 Worker Deployment Versioning，其中可复用�
 
 `invoke`、`submit`、`status`、`cancel` 只是普通 action 名称，不带 provider 语义。每个 action 独立配置 method、endpoint 和 schema；`response_schemas` 按十进制 HTTP status 精确匹配。需要异步任务 ID 的 endpoint 只允许使用 `{job_id}` 占位符，替换时按单个 URL path segment 转义。未配置的 action 直接返回 non-retryable `ActionNotFound`。
 
-### 4. payload 保持字节透明
+### 4. payload 保持 HTTP 对象语义透明
 
 Activity 输入输出为最小 HTTP envelope：
 
@@ -94,17 +95,18 @@ type Response struct {
 }
 ```
 
-- method、endpoint 和 schema 来自 immutable revision 中对应的 action，body 不做重编码。
-- 仅在 request 是 JSON 且 action 配置了 `request_schema` 时，解析 request body 的副本进行 JSON Schema 2020-12 校验；实际发送仍使用原始字节。
-- Gateway 不从响应中提取 Job ID；调用方从原始 response body 读取后，在后续 action 的 `JobID` 字段传回。
-- `Message` 是 Gateway 生成的简短可读说明。收到 HTTP response 时使用 `http.StatusText(Status)`；不从 body 猜测或提取后端错误消息，完整信息仍以原始 body 为准。
+- method、endpoint 和 schema 来自 immutable revision 中对应的 action。Gateway 不解析、映射或重组业务对象。
+- 仅在 request 是 JSON 且 action 配置了 `request_schema` 时，解析 request body 的副本进行 JSON Schema 2020-12 校验；交给 `net/http` 的仍是 Activity 输入中的 body。
+- Gateway 不从响应中提取 Job ID；调用方从 HTTP response body 读取后，在后续 action 的 `JobID` 字段传回。
+- `Message` 是 Gateway 生成的简短可读说明。收到 HTTP response 时使用 `http.StatusText(Status)`；不从 body 猜测或提取后端错误消息，完整信息仍在 `Body` 中。
 - 透传端到端 header，包括后端所需的鉴权和幂等键；移除 `Connection`、`Transfer-Encoding`、`Content-Length` 等 hop-by-hop/传输层 header，由 Go HTTP client 重建。
 - HTTP client 按 Go `net/http` 标准语义跟随 redirect，最多 10 次，并返回最终响应。跨 host redirect 的敏感 header 遵循 `net/http` 的安全转发规则，不由 Gateway 重新复制；超过上限或 redirect 失败作为 Activity failure。
+- gzip 自动协商与解压、redirect、framing 等由 `net/http` 在 HTTP 边界处理；Response 表达的是 `net/http` 暴露的 HTTP 对象，不承诺与 wire bytes 相同。
 - 后端返回的任何 HTTP status（包括 4xx/5xx）都作为正常 `Response` 返回，保留后端语义，不自动变成 Activity failure。
 - 仅当最终 HTTP status 在 action 的 `response_schemas` 中存在精确匹配，且 response 是 JSON 时才校验；没有配置的 status（包括 202）不校验。首版不支持 `2xx`、范围或 `default` 通配规则。
 - DNS、连接、超时等未获得 HTTP response 的错误才作为 Activity failure；是否重试由调用 Workflow 的 Activity Retry Policy 决定。
 - schema 不匹配和服务已删除返回 non-retryable Application Error。
-- Temporal cancellation 直接取消正在进行的 HTTP request。
+- 取消采用协作式语义：持续执行的 HTTP Activity 周期性发送空 heartbeat，使未启用 proactive Worker Commands 的 Temporal Server 也能下发取消；收到的 Go context cancellation 会取消正在进行的 HTTP request。调用 Workflow 通过 `HeartbeatTimeout` 控制取消传播延迟，并通过 `WaitForCancellation` 决定是否等待 Activity 实际退出。HTTP 连接取消只终止 Gateway 本地调用；根据当前系统约束，可安全假设远端不会在断开后留下副作用。
 
 Activity 参数仍受 Temporal payload/Event History 限制；大对象必须由调用方改传对象存储引用，不在首版 Gateway 中增加对象存储协议。
 
@@ -115,7 +117,7 @@ Activity 参数仍受 Temporal payload/Event History 限制；大对象必须由
 SQLite 保存完整历史，不覆盖旧 revision：
 
 - `services`：`id`、`state`、`current_revision`、时间戳。
-- `service_revisions`：`service_id`、`revision`、`kind`（`service`/`tombstone`）、`state`、规范化 `spec_json`、配置 hash、时间戳。
+- `service_revisions`：`service_id`、`revision`、`kind`（`service`/`tombstone`）、`state`、`switch_started`、规范化 `spec_json`、配置 hash、时间戳。
 
 Activity Type、Task Queue、Deployment Name 和 Build ID 均由 `service_id/revision` 推导，不重复存储。
 
@@ -172,7 +174,7 @@ SQLite Registry ◄──► Reconciler / Worker Manager
 
 所有 Worker 共享一个 Temporal client 和一个 HTTP client；每个 revision 只有 Worker、注册的 Activity closure 和本地 in-flight 计数是独立的。
 
-同一进程内的管理面变更由 Manager 串行执行，确保同一服务的 PUT、DELETE 和 revision 切换具有全序；Activity 执行不经过该锁，可由 Temporal Worker 并发调度。首版的全局管理锁也会串行不同服务的更新，因此一次慢切流最多会阻塞其他管理请求一个 `switch-timeout`，但不会阻塞已经运行的 Activity。
+同一进程内的管理面变更由 Manager 串行执行，确保同一服务的 PUT、DELETE 和 revision 切换具有全序；Activity 执行不经过该锁，可由 Temporal Worker 并发调度。首版的全局管理锁也会串行不同服务的更新；等待时间包括前序请求排队、切流和旧 Worker 排空，但不会阻塞已经运行的 Activity。关闭时所有 Worker 同时开始 graceful Stop，避免按服务数串行累加排空时间。
 
 ## 安全与运行约束
 
@@ -198,7 +200,7 @@ WCI 启动的是连接回 Temporal 并 poll Task Queue 的 Worker，不是通用
 
 ### provider SDK adapter
 
-所有目标均能通过 HTTP 调用，provider SDK 不会改善透明 payload，反而增加依赖和各平台语义分支。
+所有目标均能通过 HTTP 调用，provider SDK 不会改善 HTTP 对象语义透明性，反而增加依赖和各平台语义分支。
 
 ## 影响
 
@@ -215,7 +217,7 @@ WCI 启动的是连接回 Temporal 并 poll Task Queue 的 Worker，不是通用
 - 不同服务的控制面变更目前共享全局锁，慢切流会增加其他服务配置更新的延迟；业务 Activity 调度不受影响。
 - Worker Deployment 管理 API 在 Go SDK 中仍标记为 experimental，升级 SDK/Server 时需要做兼容验证。
 - tombstone Worker 不能自动物理删除；只有确认所有调用方都不再调度该服务后才能人工清理。
-- payload 透明不等于不落盘，Temporal History 的体积和敏感数据治理仍由部署方负责。
+- HTTP 对象语义透明不等于不落盘，Temporal History 的体积和敏感数据治理仍由部署方负责。
 
 ## 参考
 

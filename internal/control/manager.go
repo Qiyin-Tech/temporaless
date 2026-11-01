@@ -65,9 +65,10 @@ type Manager struct {
 	client   *http.Client
 	options  ManagerOptions
 
-	opMu    sync.Mutex
-	workers map[workerKey]Worker
-	closed  bool
+	opMu      sync.Mutex
+	workers   map[workerKey]Worker
+	closed    bool
+	closeDone chan struct{}
 }
 
 func NewManager(store *registry.Registry, runtime Runtime, client *http.Client, options ManagerOptions) *Manager {
@@ -81,11 +82,12 @@ func NewManager(store *registry.Registry, runtime Runtime, client *http.Client, 
 		options.RetryInterval = 100 * time.Millisecond
 	}
 	return &Manager{
-		registry: store,
-		runtime:  runtime,
-		client:   client,
-		options:  options,
-		workers:  make(map[workerKey]Worker),
+		registry:  store,
+		runtime:   runtime,
+		client:    client,
+		options:   options,
+		workers:   make(map[workerKey]Worker),
+		closeDone: make(chan struct{}),
 	}
 }
 
@@ -180,20 +182,20 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	reconcileErrors := m.prewarmCurrent(services)
+	prewarmErrors := m.prewarmCurrent(services)
 
 	starting, err := m.registry.ListStarting(ctx)
 	if err != nil {
-		return errors.Join(append(reconcileErrors, err)...)
+		return errors.Join(append(prewarmErrorValues(prewarmErrors, nil), err)...)
 	}
-	processed, startingErrors := m.reconcileStarting(ctx, starting)
-	reconcileErrors = append(reconcileErrors, startingErrors...)
+	processed, activated, reconcileErrors := m.reconcileStarting(ctx, starting)
+	reconcileErrors = append(prewarmErrorValues(prewarmErrors, activated), reconcileErrors...)
 	reconcileErrors = append(reconcileErrors, m.restoreCurrent(ctx, services, processed)...)
 	return errors.Join(reconcileErrors...)
 }
 
-func (m *Manager) prewarmCurrent(services []registry.Service) []error {
-	var reconcileErrors []error
+func (m *Manager) prewarmCurrent(services []registry.Service) map[string]error {
+	reconcileErrors := make(map[string]error)
 	for _, service := range services {
 		if service.CurrentRevision == 0 {
 			continue
@@ -203,17 +205,28 @@ func (m *Manager) prewarmCurrent(services []registry.Service) []error {
 			_, _, err = m.startWorker(service.Current, activity)
 		}
 		if err != nil {
-			reconcileErrors = append(reconcileErrors, fmt.Errorf("start current %s/r%d: %w", service.ID, service.CurrentRevision, err))
+			reconcileErrors[service.ID] = fmt.Errorf("start current %s/r%d: %w", service.ID, service.CurrentRevision, err)
 		}
 	}
 	return reconcileErrors
 }
 
-func (m *Manager) reconcileStarting(ctx context.Context, starting []registry.Revision) (map[string]struct{}, []error) {
+func prewarmErrorValues(failures map[string]error, replaced map[string]struct{}) []error {
+	result := make([]error, 0, len(failures))
+	for serviceID, err := range failures {
+		if _, ok := replaced[serviceID]; !ok {
+			result = append(result, err)
+		}
+	}
+	return result
+}
+
+func (m *Manager) reconcileStarting(ctx context.Context, starting []registry.Revision) (map[string]struct{}, map[string]struct{}, []error) {
 	processed := make(map[string]struct{}, len(starting))
+	activated := make(map[string]struct{}, len(starting))
 	var reconcileErrors []error
 	for _, revision := range starting {
-		operationCtx, cancel := m.operationContext(ctx)
+		operationCtx, cancel := m.reconcileOperationContext(ctx)
 		err := m.applyStoredRevision(operationCtx, revision)
 		cancel()
 		if err != nil {
@@ -223,14 +236,15 @@ func (m *Manager) reconcileStarting(ctx context.Context, starting []registry.Rev
 			}
 			err = errors.Join(err, stateErr)
 			reconcileErrors = append(reconcileErrors, fmt.Errorf("resume %s/r%d: %w", revision.ServiceID, revision.Number, err))
-			if routingMustNotRollback(err) {
+			if revision.SwitchStarted || routingMustNotRollback(err) {
 				processed[revision.ServiceID] = struct{}{}
 			}
 			continue
 		}
 		processed[revision.ServiceID] = struct{}{}
+		activated[revision.ServiceID] = struct{}{}
 	}
-	return processed, reconcileErrors
+	return processed, activated, reconcileErrors
 }
 
 func (m *Manager) restoreCurrent(ctx context.Context, services []registry.Service, processed map[string]struct{}) []error {
@@ -242,7 +256,7 @@ func (m *Manager) restoreCurrent(ctx context.Context, services []registry.Servic
 		if _, ok := processed[service.ID]; ok {
 			continue
 		}
-		operationCtx, cancel := m.operationContext(ctx)
+		operationCtx, cancel := m.reconcileOperationContext(ctx)
 		err := m.ensureCurrent(operationCtx, service.Current)
 		cancel()
 		if err != nil {
@@ -258,15 +272,31 @@ func (m *Manager) Health(ctx context.Context) error {
 
 func (m *Manager) Close() {
 	m.opMu.Lock()
-	defer m.opMu.Unlock()
 	if m.closed {
+		done := m.closeDone
+		m.opMu.Unlock()
+		<-done
 		return
 	}
 	m.closed = true
+	workers := make([]Worker, 0, len(m.workers))
 	for key, worker := range m.workers {
-		worker.Stop()
+		workers = append(workers, worker)
 		delete(m.workers, key)
 	}
+	done := m.closeDone
+	m.opMu.Unlock()
+
+	var stops sync.WaitGroup
+	stops.Add(len(workers))
+	for _, worker := range workers {
+		go func() {
+			defer stops.Done()
+			worker.Stop()
+		}()
+	}
+	stops.Wait()
+	close(done)
 }
 
 func (m *Manager) resumeStarting(ctx context.Context, serviceID string) error {
@@ -287,7 +317,9 @@ func (m *Manager) resumeStarting(ctx context.Context, serviceID string) error {
 func (m *Manager) applyStoredRevision(ctx context.Context, revision registry.Revision) error {
 	activity, err := m.activityFor(revision)
 	if err != nil {
-		m.markFailed(revision)
+		if !revision.SwitchStarted {
+			m.markFailed(revision)
+		}
 		return err
 	}
 	return m.applyRevision(ctx, revision, activity)
@@ -302,7 +334,7 @@ func (m *Manager) ensureCurrent(ctx context.Context, revision registry.Revision)
 	if err != nil {
 		return err
 	}
-	if err := m.setCurrent(ctx, revision); err != nil {
+	if err := m.setCurrent(ctx, revision, false); err != nil {
 		return err
 	}
 	m.workers[workerKey{serviceID: revision.ServiceID, revision: revision.Number}] = worker
@@ -311,12 +343,24 @@ func (m *Manager) ensureCurrent(ctx context.Context, revision registry.Revision)
 }
 
 func (m *Manager) applyRevision(ctx context.Context, revision registry.Revision, activity Activity) error {
+	priorSwitchAttempt := revision.SwitchStarted
 	worker, started, err := m.startWorker(revision, activity)
 	if err != nil {
-		m.markFailed(revision)
+		if !priorSwitchAttempt {
+			m.markFailed(revision)
+		}
 		return err
 	}
-	if err := m.setCurrent(ctx, revision); err != nil {
+	if !priorSwitchAttempt {
+		if err := m.registry.MarkSwitchStarted(ctx, revision.ServiceID, revision.Number); err != nil {
+			if started {
+				m.stopWorker(revision.ServiceID, revision.Number)
+			}
+			return err
+		}
+		revision.SwitchStarted = true
+	}
+	if err := m.setCurrent(ctx, revision, priorSwitchAttempt); err != nil {
 		if isKnownSwitchFailure(err) {
 			m.markFailed(revision)
 			if started {
@@ -363,26 +407,31 @@ type routingAppliedError struct{ err error }
 func (e *routingAppliedError) Error() string { return e.err.Error() }
 func (e *routingAppliedError) Unwrap() error { return e.err }
 
-func (m *Manager) setCurrent(ctx context.Context, revision registry.Revision) error {
+func (m *Manager) setCurrent(ctx context.Context, revision registry.Revision, priorSwitchAttempt bool) error {
 	build := buildID(revision.Number)
 	var lastErr error
+	unknownOutcome := priorSwitchAttempt
 	for {
 		lastErr = m.runtime.SetCurrent(ctx, revision.ServiceID, build)
 		if lastErr == nil {
 			return nil
 		}
+		definitiveRejection := definitiveSwitchRejection(lastErr)
+		if !definitiveRejection {
+			unknownOutcome = true
+		}
 		if !retryableSwitchError(lastErr) {
-			return m.observeSwitchResult(revision, lastErr, nil)
+			return m.observeSwitchResult(revision, lastErr, nil, definitiveRejection && !unknownOutcome)
 		}
 		select {
 		case <-ctx.Done():
-			return m.observeSwitchResult(revision, lastErr, ctx.Err())
+			return m.observeSwitchResult(revision, lastErr, ctx.Err(), definitiveRejection && !unknownOutcome)
 		case <-time.After(m.options.RetryInterval):
 		}
 	}
 }
 
-func (m *Manager) observeSwitchResult(revision registry.Revision, switchErr, contextErr error) error {
+func (m *Manager) observeSwitchResult(revision registry.Revision, switchErr, contextErr error, knownIfDifferent bool) error {
 	probeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	current, probeErr := m.runtime.Current(probeCtx, revision.ServiceID)
 	cancel()
@@ -391,7 +440,7 @@ func (m *Manager) observeSwitchResult(revision registry.Revision, switchErr, con
 	}
 	return &switchError{
 		err:   fmt.Errorf("set current version: %w", errors.Join(switchErr, contextErr, probeErr)),
-		known: probeErr == nil,
+		known: probeErr == nil && knownIfDifferent,
 	}
 }
 
@@ -410,17 +459,31 @@ func routingMustNotRollback(err error) bool {
 }
 
 func retryableSwitchError(err error) bool {
-	code := status.Code(err)
-	var temporalStatus interface{ Status() *status.Status }
-	if errors.As(err, &temporalStatus) {
-		code = temporalStatus.Status().Code()
-	}
+	code := switchErrorCode(err)
 	switch code {
 	case codes.NotFound, codes.FailedPrecondition, codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Aborted:
 		return true
 	default:
 		return false
 	}
+}
+
+func definitiveSwitchRejection(err error) bool {
+	switch switchErrorCode(err) {
+	case codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied, codes.Unauthenticated:
+		return true
+	default:
+		return false
+	}
+}
+
+func switchErrorCode(err error) codes.Code {
+	code := status.Code(err)
+	var temporalStatus interface{ Status() *status.Status }
+	if errors.As(err, &temporalStatus) {
+		code = temporalStatus.Status().Code()
+	}
+	return code
 }
 
 func (m *Manager) activityFor(revision registry.Revision) (Activity, error) {
@@ -498,6 +561,10 @@ func serviceView(service registry.Service) (ServiceView, error) {
 
 func (m *Manager) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), m.options.SwitchTimeout)
+}
+
+func (m *Manager) reconcileOperationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, m.options.SwitchTimeout)
 }
 
 func validateServiceID(serviceID string) error {

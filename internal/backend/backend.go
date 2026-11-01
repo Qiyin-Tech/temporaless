@@ -177,11 +177,11 @@ func normalizeEndpoint(raw string) (string, bool, error) {
 	if strings.ContainsAny(withoutJobID, "{}") {
 		return "", false, errors.New("endpoint contains an unsupported placeholder")
 	}
-	hasJobID := strings.Contains(endpointText, "{job_id}")
-	if hasJobID && !strings.Contains(endpoint.Path, "{job_id}") {
+	pathPlaceholders := strings.Count(endpoint.Path, "{job_id}")
+	if strings.Count(endpointText, "{job_id}") != pathPlaceholders {
 		return "", false, errors.New("{job_id} is only allowed in the URL path")
 	}
-	return endpointText, hasJobID, nil
+	return endpointText, pathPlaceholders > 0, nil
 }
 
 func compileResponseSchemas(rawSchemas map[string]json.RawMessage) (map[int]*jsonschema.Schema, map[string]json.RawMessage, error) {

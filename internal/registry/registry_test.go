@@ -2,7 +2,9 @@ package registry
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 )
 
@@ -36,6 +38,12 @@ func TestRevisionLifecycle(t *testing.T) {
 	starting, err := store.ListStarting(ctx)
 	if err != nil || len(starting) != 1 || starting[0].Number != 2 {
 		t.Fatalf("starting revisions = %#v err=%v", starting, err)
+	}
+	if err := store.MarkSwitchStarted(ctx, "image.generate", 2); err != nil {
+		t.Fatalf("mark switch started: %v", err)
+	}
+	if switching := getRevision(t, store, "image.generate", 2); !switching.SwitchStarted {
+		t.Fatalf("switch_started = false: %#v", switching)
 	}
 	services, err := store.List(ctx)
 	if err != nil || len(services) != 1 || services[0].CurrentRevision != 1 {
@@ -124,8 +132,48 @@ func TestInvalidRevisionTransitions(t *testing.T) {
 	if err := store.Activate(ctx, "service-a", revision.Number); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("activate failed revision error = %v", err)
 	}
+	if err := store.MarkSwitchStarted(ctx, "service-a", revision.Number); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("mark failed revision switching error = %v", err)
+	}
 	if _, err := store.Get(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("get missing error = %v", err)
+	}
+}
+
+func TestMigrationTreatsExistingStartingRevisionAsSwitchAttempted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE services (
+			id TEXT PRIMARY KEY, state TEXT NOT NULL, current_revision INTEGER,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		);
+		CREATE TABLE service_revisions (
+			service_id TEXT NOT NULL, revision INTEGER NOT NULL, kind TEXT NOT NULL,
+			state TEXT NOT NULL, spec_json BLOB, config_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY (service_id, revision)
+		);
+		INSERT INTO services VALUES ('service-a', 'starting', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+		INSERT INTO service_revisions VALUES ('service-a', 1, 'service', 'starting', '{}', 'hash', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+	`)
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if revision := getRevision(t, store, "service-a", 1); !revision.SwitchStarted {
+		t.Fatalf("migrated revision = %#v", revision)
 	}
 }
 

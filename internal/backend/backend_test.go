@@ -241,6 +241,7 @@ func TestCompileRejectsInvalidServiceSpec(t *testing.T) {
 		{name: "missing host", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "POST", Endpoint: "https:///run"}}}},
 		{name: "unknown placeholder", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com/{other}"}}}},
 		{name: "placeholder in query", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com/?id={job_id}"}}}},
+		{name: "placeholder in path and query", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com/jobs/{job_id}?id={job_id}"}}}},
 		{name: "bad response status", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com", ResponseSchemas: map[string]json.RawMessage{"2xx": json.RawMessage(`{}`)}}}}},
 		{name: "low response status", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com", ResponseSchemas: map[string]json.RawMessage{"99": json.RawMessage(`{}`)}}}}},
 		{name: "high response status", spec: temporaless.ServiceSpec{Timeout: "1s", Actions: map[string]temporaless.ActionSpec{"invoke": {Method: "GET", Endpoint: "https://example.com", ResponseSchemas: map[string]json.RawMessage{"600": json.RawMessage(`{}`)}}}}},
@@ -330,7 +331,7 @@ func TestRevisionInvokeHonorsTimeout(t *testing.T) {
 	}
 }
 
-func TestRevisionInvokePropagatesCancellation(t *testing.T) {
+func TestRevisionInvokePropagatesContextCancellation(t *testing.T) {
 	t.Parallel()
 
 	started := make(chan struct{})

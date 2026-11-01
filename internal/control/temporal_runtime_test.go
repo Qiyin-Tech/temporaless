@@ -2,10 +2,34 @@ package control
 
 import (
 	"testing"
+	"time"
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
+
+func TestHeartbeatInterval(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{name: "unset", want: time.Second},
+		{name: "long", timeout: 10 * time.Second, want: time.Second},
+		{name: "short", timeout: time.Second, want: 500 * time.Millisecond},
+		{name: "minimum", timeout: time.Nanosecond, want: time.Nanosecond},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := heartbeatInterval(test.timeout); got != test.want {
+				t.Fatalf("heartbeat interval = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
 
 func TestCurrentBuildID(t *testing.T) {
 	t.Parallel()

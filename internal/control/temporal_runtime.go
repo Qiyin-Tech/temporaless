@@ -4,10 +4,14 @@ import (
 	"context"
 	"time"
 
+	"temporaless"
+
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
+
+const activityHeartbeatInterval = time.Second
 
 type TemporalRuntime struct {
 	client      client.Client
@@ -33,11 +37,48 @@ func (r *TemporalRuntime) Start(serviceID string, buildID string, activityFn Act
 			},
 		},
 	})
-	activityWorker.RegisterActivityWithOptions(activityFn, activity.RegisterOptions{Name: serviceID + "/invoke"})
+	activityWorker.RegisterActivityWithOptions(withActivityHeartbeat(activityFn), activity.RegisterOptions{Name: serviceID + "/invoke"})
 	if err := activityWorker.Start(); err != nil {
 		return nil, err
 	}
 	return activityWorker, nil
+}
+
+func withActivityHeartbeat(activityFn Activity) Activity {
+	return func(ctx context.Context, request temporaless.Request) (temporaless.Response, error) {
+		heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+		heartbeatDone := make(chan struct{})
+		interval := heartbeatInterval(activity.GetInfo(ctx).HeartbeatTimeout)
+		go func() {
+			defer close(heartbeatDone)
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-heartbeatCtx.Done():
+					return
+				case <-ticker.C:
+					activity.RecordHeartbeat(heartbeatCtx)
+				}
+			}
+		}()
+		defer func() {
+			stopHeartbeat()
+			<-heartbeatDone
+		}()
+
+		return activityFn(ctx, request)
+	}
+}
+
+func heartbeatInterval(timeout time.Duration) time.Duration {
+	if timeout > 0 && timeout/2 < activityHeartbeatInterval {
+		if interval := timeout / 2; interval > 0 {
+			return interval
+		}
+		return timeout
+	}
+	return activityHeartbeatInterval
 }
 
 func (r *TemporalRuntime) SetCurrent(ctx context.Context, serviceID string, buildID string) error {
