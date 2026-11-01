@@ -1,97 +1,143 @@
 # temporaless
 
-`temporaless` 是一个 Go 编写的 Temporal Activity Worker Gateway。每个注册的 HTTP 服务拥有稳定的 Activity Type、Task Queue 和 Worker Deployment，通过 revision Build ID 实现热新增、热更新和 tombstone 热删除。
+`temporaless` 是一个 Go 编写的 Temporal Activity Worker Gateway。每个注册的 HTTP 服务拥有稳定的 Activity Type、Task Queue 和 Worker Deployment；配置 revision 通过 Build ID 完成热新增、热更新和 tombstone 热删除。
 
-## 启动
+```text
+Workflow ── Temporal Activity ── temporaless ── HTTP backend
+                 │                    │
+       stable service ID       hot revision switch
+```
 
-先启动本地 Temporal，然后运行：
+Gateway 不引入 Runpod、阿里云 FC 等 provider SDK。只要后端提供 HTTP endpoint，就可以注册为 Temporal Activity。
+
+## Quick Start
+
+需要 Go 1.25.4+ 和 Temporal CLI。以下命令分别在不同终端运行。
+
+启动本地 Temporal：
+
+```bash
+temporal server start-dev
+```
+
+启动仓库自带的 HTTP 后端：
+
+```bash
+go run ./examples/backend
+```
+
+启动 Gateway：
 
 ```bash
 go run ./cmd/temporaless \
-  -listen 127.0.0.1:8080 \
-  -db temporaless.db \
-  -temporal-address localhost:7233 \
-  -temporal-namespace default \
-  -max-concurrent-activities-per-service 32 \
-  -max-backend-response-bytes 1048576 \
-  -control-read-timeout 15s \
-  -max-idle-connections-per-host 32
+  -db /tmp/temporaless-quickstart.db
 ```
 
-默认只监听 loopback。生产使用前需要为管理 API 增加鉴权，并处理 Temporal History 中 payload 的加密或 secret reference。
-
-## 注册服务
-
-服务 ID 必须匹配 `^[a-z0-9][a-z0-9_-]{0,127}$`。
+注册服务：
 
 ```bash
-curl -X PUT http://127.0.0.1:8080/services/runpod-image \
+curl --fail-with-body \
+  -X PUT http://127.0.0.1:8080/services/demo-service \
   -H 'Content-Type: application/json' \
   -d '{
     "actions": {
       "invoke": {
         "method": "POST",
-        "endpoint": "https://example.com/runsync",
-        "request_schema": {"type": "object"},
-        "response_schemas": {
-          "200": {"type": "object"}
-        }
+        "endpoint": "http://127.0.0.1:18080/runsync"
       },
       "status": {
         "method": "GET",
-        "endpoint": "https://example.com/jobs/{job_id}"
+        "endpoint": "http://127.0.0.1:18080/jobs/{job_id}"
       }
     },
     "health": {
       "method": "GET",
-      "endpoint": "https://example.com/health",
+      "endpoint": "http://127.0.0.1:18080/health",
       "timeout": "3s"
     },
-    "timeout": "5m"
+    "timeout": "10s"
   }'
 ```
 
-相同规范化配置的重复 `PUT` 不产生新 revision。更新配置会先启动新 Worker、切换 Current Version，再优雅停止旧 Worker。
+运行真实的 Workflow Worker 和 Temporal Client：
 
-管理接口：
+```bash
+go run ./examples/caller
+```
 
-- `PUT /services/{id}`：新增、恢复或更新服务。
-- `GET /services`：列出服务。
-- `GET /services/{id}`：读取服务及 revision 状态。
-- `GET /services/{id}/health`：执行可选的后端健康探针；任意 2xx 表示 healthy，响应和结构化日志都包含 latency。
-- `DELETE /services/{id}`：切换到返回 `ServiceDeleted` 的 tombstone revision。
-- `GET /healthz`：检查 SQLite 与 Temporal。
+预期结果：Workflow 将 `demo-service/invoke` 调度到 `demo-service` Task Queue，Gateway 调用示例后端并返回 `200 OK` 和 JSON body。Temporal UI 位于 <http://localhost:8233>。
 
-## 调度 Activity
+逐步说明、完整 schema 和预期输出见 [Quick Start](docs/quickstart.md)。
+
+## 稳定的 Temporal 契约
 
 调用方始终使用：
 
 - Activity Type：`{service_id}/invoke`
 - Task Queue：`{service_id}`
 
-Activity payload：
+Go payload：
 
 ```go
 temporaless.Request{
     Action: "invoke",
     Headers: http.Header{
         "Authorization":   {"Bearer ..."},
+        "Content-Type":    {"application/json"},
         "Idempotency-Key": {operationID},
     },
-    Body: rawBody,
+    Body: []byte(`{"prompt":"hello"}`),
 }
 ```
 
-响应使用 Go `net/http` 暴露的 status、header 和 body 构造 `temporaless.Response`。Gateway 不解析或重组业务对象；4xx/5xx 是正常 Activity 结果，网络错误、连接错误和超时才是 Activity failure。配置 schema 时，仅对 JSON body 的副本做校验。这里承诺的是 HTTP 对象语义透明，不是 wire bytes 透明：redirect、gzip 解压和 framing 等仍按 `net/http` 标准行为处理。
+响应是 `temporaless.Response`，包含 `Status`、`Message`、`Headers` 和 `Body`。Gateway 保持 HTTP 对象语义，不映射业务对象；redirect、gzip 和 framing 仍按 Go `net/http` 行为处理。
 
-Gateway 会在持续执行的 HTTP Activity 中发送空 heartbeat，使 Workflow cancellation 能取消 Activity context 和正在进行的 HTTP request。调用 Workflow 应按期望的取消延迟设置 `HeartbeatTimeout`；只有需要等待 HTTP 调用实际退出时才设置 `WaitForCancellation: true`，默认值 `false` 只发出取消请求而不等待确认。
+HTTP 4xx/5xx 是正常 Activity 结果。DNS、连接错误和 timeout 是 Activity failure，由调用方 Retry Policy 决定是否重试。Gateway 发送 Activity heartbeat，使 Workflow cancellation 能取消正在进行的 HTTP request。
 
-后端响应体默认上限为 1 MiB；更大的结果应返回对象存储引用，也可通过启动参数调整。每个服务默认最多并发执行 32 个 Activity。
+完整调用代码见 [examples/caller/main.go](examples/caller/main.go)。
 
-## Limitations
+## 管理 API
 
-- 管理 API 没有内建鉴权，并允许注册任意 HTTP/HTTPS endpoint，因此生产环境必须在入口增加鉴权，并通过网络策略限制 endpoint 和 egress；默认 loopback 监听只适合本地使用。
-- Activity 的 header、请求体和响应体都会进入 Temporal Event History。生产凭据和敏感数据必须使用 Payload Codec 加密，或改传 secret reference。
+| Method | Path | 作用 |
+|---|---|---|
+| `PUT` | `/services/{id}` | 新增、更新或恢复服务，成功前完成 Worker 切流 |
+| `GET` | `/services` | 列出全部服务和 revision 状态 |
+| `GET` | `/services/{id}` | 读取单个服务 |
+| `GET` | `/services/{id}/health` | 调用可选的后端 health endpoint 并记录 latency |
+| `DELETE` | `/services/{id}` | 切换到 tombstone revision |
+| `GET` | `/healthz` | 检查 SQLite 和 Temporal 连接 |
+
+完整请求、响应、状态码和配置字段见 [REST 与 Temporal API](docs/api.md)。
+
+## 热更新和删除
+
+相同规范化配置的重复 `PUT` 是 no-op。配置变化会：
+
+1. 在 SQLite 创建 starting revision。
+2. 启动新 Build ID Worker。
+3. 将 Worker Deployment Current Version 切到新 revision。
+4. 激活新 revision 并优雅排空旧 Worker。
+
+`DELETE` 创建 tombstone revision。之后错误调度到稳定 Task Queue 的新 Activity 会快速得到 non-retryable `ServiceDeleted`，不会永久等待没有 Worker 的队列。重新 `PUT` 相同 service ID 可以恢复服务。
+
+## 运行参数
+
+常用参数及默认值：
+
+```text
+-listen                                  127.0.0.1:8080
+-db                                      temporaless.db
+-temporal-address                        localhost:7233
+-temporal-namespace                      default
+-switch-timeout                          30s
+-worker-stop-timeout                     30s
+-max-concurrent-activities-per-service   32
+-max-backend-response-bytes              1048576
+-control-read-timeout                    15s
+-max-idle-connections-per-host           32
+```
+
+详细语义见 [进程参数](docs/api.md#进程参数)。
 
 ## 验证
 
@@ -100,6 +146,17 @@ go test ./...
 TEMPORAL_SMOKE=1 go test ./...
 ```
 
-第二条命令需要 `localhost:7233` 上运行 Temporal，覆盖 Worker Deployment backlog、并发 in-flight Activity 排空、Activity heartbeat 取消传播以及完整的 r1 → r2 → tombstone 调用链。
+第二条命令需要 `localhost:7233` 上运行 Temporal，覆盖 Worker Deployment backlog、并发 in-flight Activity 排空、heartbeat 取消传播以及完整的 r1 → r2 → tombstone 调用链。
 
-架构与失败语义见 [ADR-0001](docs/adr/0001-hot-reloadable-http-activity-workers.md)。
+## 文档
+
+- [Quick Start](docs/quickstart.md)：从本地环境到真实 Workflow 调用。
+- [REST 与 Temporal API](docs/api.md)：配置 schema、管理 API、Activity contract、错误和参数。
+- [ADR-0001](docs/adr/0001-hot-reloadable-http-activity-workers.md)：版本路由、失败恢复、取消和 tombstone 的设计依据。
+
+## Limitations
+
+- 管理 API 没有内建鉴权，并允许注册任意 HTTP/HTTPS endpoint。默认 loopback 只适合本地使用；生产环境必须增加入口鉴权和 endpoint/egress 网络约束。
+- Activity header、请求体和响应体会进入 Temporal Event History。生产凭据必须配置 Payload Codec 加密，或改传 secret reference。
+- 后端响应体默认限制为 1 MiB，可通过启动参数调整。大对象更适合返回对象存储引用。
+- 首版只允许一个 Gateway 进程管理同一个 SQLite 文件和 Temporal Namespace。

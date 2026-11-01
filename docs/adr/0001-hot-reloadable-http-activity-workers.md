@@ -137,10 +137,11 @@ Activity Type、Task Queue、Deployment Name 和 Build ID 均由 `service_id/rev
 - `PUT /services/{id}`：新增或更新；成功响应前必须完成 Worker 就绪和 Current Version 切换。
 - `GET /services`：列出服务。
 - `GET /services/{id}`：读取当前配置和 revision 状态。
+- `GET /services/{id}/health`：执行当前 revision 配置的可选 HTTP health 探针并记录 latency。
 - `DELETE /services/{id}`：热删除。
 - `GET /healthz`：检查进程、SQLite 和 Temporal 连接。
 
-管理 API 与 Activity Task Queue 是两个边界：REST API 只管理配置，不代理业务调用。
+管理 API 与 Activity Task Queue 是两个边界：REST API 管理配置并执行显式 health 探针，不代理业务请求或复用 Activity payload。
 
 ### 7. 删除使用 tombstone version
 
