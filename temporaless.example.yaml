@@ -21,7 +21,7 @@ worker:
   switch_timeout: 30s
   stop_timeout: 30s
   max_concurrent_activities_per_service: 32
-  max_concurrent_activity_task_pollers: 0
+  max_concurrent_activity_task_pollers: 32
 
 # Shared HTTP client limits.
 http:
