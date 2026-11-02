@@ -134,6 +134,18 @@ go run ./cmd/temporaless -config temporaless.example.yaml
 
 省略 `-config` 时使用内建默认值。完整 YAML 和每个参数的默认值、单位与作用见 [Gateway YAML 配置](docs/api.md#gateway-yaml-配置)。
 
+## 可观测性
+
+进程日志统一输出 JSON 到 stdout，Temporal Go SDK 日志也通过同一 logger 输出，并带有 `service=temporaless` 和 `component=temporal_sdk` 字段。由 vlagent、Vector 或容器日志采集器转发到 VictoriaLogs 即可，Gateway 不持有 VictoriaLogs 地址或凭据。
+
+Prometheus metrics server 默认关闭。配置 `observability.metrics.listen` 后，它会在独立端口只提供 `GET /metrics`，包含 Temporal SDK、Go runtime 和进程指标；可由 vmagent 或其他 Prometheus-compatible scraper 采集。例如仓库示例配置启用：
+
+```bash
+curl http://127.0.0.1:9090/metrics
+```
+
+该端点没有鉴权，不应直接暴露到公网。
+
 ## Docker
 
 CI 会将 Linux amd64 镜像发布到 GHCR。默认分支使用 `latest`，分支、Git tag、SemVer 和 commit 另有独立 tag：
@@ -157,6 +169,9 @@ registry:
   path: /var/lib/temporaless/temporaless.db
 temporal:
   address: host.docker.internal:7233
+observability:
+  metrics:
+    listen: 0.0.0.0:9090
 ```
 
 其余字段继续沿用示例值，然后将 YAML 只读挂载到固定路径，将 SQLite 目录挂到持久卷：
@@ -165,6 +180,7 @@ temporal:
 docker run --rm --name temporaless \
   --add-host host.docker.internal:host-gateway \
   -p 8080:8080 \
+  -p 9090:9090 \
   --mount type=bind,src="$PWD/temporaless.docker.yaml",dst=/etc/temporaless/config.yaml,readonly \
   --mount type=volume,src=temporaless-data,dst=/var/lib/temporaless \
   ghcr.io/qiyin-tech/temporaless:latest

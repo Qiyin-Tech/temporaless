@@ -20,6 +20,9 @@ worker:
   switch_timeout: 45s
 http:
   max_backend_response_bytes: 2097152
+observability:
+  metrics:
+    listen: 127.0.0.1:9090
 `)
 	configuration, err := loadConfig(path)
 	if err != nil {
@@ -34,6 +37,9 @@ http:
 	if configuration.HTTP.MaxBackendResponseBytes != 2<<20 {
 		t.Fatalf("HTTP config = %#v", configuration.HTTP)
 	}
+	if configuration.Observability.Metrics.Listen != "127.0.0.1:9090" {
+		t.Fatalf("observability config = %#v", configuration.Observability)
+	}
 }
 
 func TestLoadConfigRejectsInvalidYAML(t *testing.T) {
@@ -45,6 +51,7 @@ func TestLoadConfigRejectsInvalidYAML(t *testing.T) {
 		{name: "unknown field", yaml: "server:\n  unknown: true\n", want: "field unknown not found"},
 		{name: "non-positive duration", yaml: "server:\n  read_timeout: 0s\n", want: "server.read_timeout must be positive"},
 		{name: "multiple documents", yaml: "server: {}\n---\nserver: {}\n", want: "multiple YAML documents"},
+		{name: "blank metrics listen", yaml: "observability:\n  metrics:\n    listen: '  '\n", want: "observability.metrics.listen must be empty or a listen address"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := loadConfig(writeConfig(t, test.yaml))
