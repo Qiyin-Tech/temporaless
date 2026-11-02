@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,9 +15,11 @@ import (
 	"temporaless/internal/registry"
 
 	"go.temporal.io/sdk/client"
+	temporallog "go.temporal.io/sdk/log"
 )
 
 func main() {
+	slog.SetDefault(newLogger(os.Stdout))
 	if err := run(); err != nil {
 		slog.Error("temporaless stopped", "error", err)
 		os.Exit(1)
@@ -37,7 +40,24 @@ func run() error {
 	}
 	defer store.Close()
 
-	temporalClient, err := client.Dial(client.Options{HostPort: configuration.Temporal.Address, Namespace: configuration.Temporal.Namespace})
+	var metrics *metricsEndpoint
+	if configuration.Observability.Metrics.Listen != "" {
+		metrics, err = newMetricsEndpoint(slog.Default())
+		if err != nil {
+			return err
+		}
+		defer metrics.shutdown()
+	}
+
+	temporalOptions := client.Options{
+		HostPort:  configuration.Temporal.Address,
+		Namespace: configuration.Temporal.Namespace,
+		Logger:    temporallog.NewStructuredLogger(slog.Default().With("component", "temporal_sdk")),
+	}
+	if metrics != nil {
+		temporalOptions.MetricsHandler = metrics.temporalHandler
+	}
+	temporalClient, err := client.Dial(temporalOptions)
 	if err != nil {
 		return err
 	}
@@ -60,30 +80,53 @@ func run() error {
 		return err
 	}
 
-	server := &http.Server{
+	servers := []*http.Server{{
 		Addr:              configuration.Server.Listen,
 		Handler:           control.NewAPI(manager, slog.Default()),
 		ReadHeaderTimeout: configuration.Server.ReadHeaderTimeout,
 		ReadTimeout:       configuration.Server.ReadTimeout,
 		IdleTimeout:       configuration.Server.IdleTimeout,
+	}}
+	if metrics != nil {
+		servers = append(servers, &http.Server{
+			Addr:              configuration.Observability.Metrics.Listen,
+			Handler:           metrics.httpHandler,
+			ReadHeaderTimeout: configuration.Server.ReadHeaderTimeout,
+			ReadTimeout:       configuration.Server.ReadTimeout,
+			IdleTimeout:       configuration.Server.IdleTimeout,
+		})
 	}
-	serverErrors := make(chan error, 1)
-	go func() {
-		slog.Info("control API listening", "address", configuration.Server.Listen)
-		serverErrors <- server.ListenAndServe()
-	}()
+	serverErrors := make(chan error, len(servers))
+	for index, server := range servers {
+		server := server
+		name := "control API"
+		if index == 1 {
+			name = "metrics"
+		}
+		go func() {
+			slog.Info(name+" listening", "address", server.Addr)
+			serverErrors <- server.ListenAndServe()
+		}()
+	}
 
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+	var runErr error
 	select {
 	case <-signalCtx.Done():
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), configuration.Server.ShutdownTimeout)
-		defer shutdownCancel()
-		return server.Shutdown(shutdownCtx)
 	case err := <-serverErrors:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+		if !errors.Is(err, http.ErrServerClosed) {
+			runErr = err
 		}
-		return err
 	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), configuration.Server.ShutdownTimeout)
+	defer shutdownCancel()
+	for _, server := range servers {
+		runErr = errors.Join(runErr, server.Shutdown(shutdownCtx))
+	}
+	return runErr
+}
+
+func newLogger(output io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(output, nil)).With("service", "temporaless")
 }

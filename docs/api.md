@@ -395,7 +395,7 @@ Gateway 周期性 heartbeat，使 Workflow cancellation 能传播到 Go context 
 temporaless -config /etc/temporaless/config.yaml
 ```
 
-省略 `-config` 时使用以下内建默认值。仓库中的 [temporaless.example.yaml](../temporaless.example.yaml) 可直接用于 Quick Start，其中 `registry.path` 改为 `/tmp/temporaless-quickstart.db`，其余字段与默认值一致。
+省略 `-config` 时使用以下内建默认值。仓库中的 [temporaless.example.yaml](../temporaless.example.yaml) 可直接用于 Quick Start，其中 `registry.path` 改为 `/tmp/temporaless-quickstart.db`，并在 `127.0.0.1:9090` 启用 metrics server。
 
 ```yaml
 server:
@@ -421,6 +421,10 @@ worker:
 http:
   max_backend_response_bytes: 1048576
   max_idle_connections_per_host: 32
+
+observability:
+  metrics:
+    listen: ""
 ```
 
 参数说明：
@@ -441,8 +445,11 @@ http:
 | `worker.max_concurrent_activities_per_service` | `32` | 每个服务 Worker 的 Activity 并发上限 |
 | `http.max_backend_response_bytes` | `1048576` | 读入内存并返回 Temporal 的最大后端响应体 bytes |
 | `http.max_idle_connections_per_host` | `32` | 共享 HTTP Transport 每个 host 保留的最大空闲连接数 |
+| `observability.metrics.listen` | `""` | 独立 Prometheus server 的监听地址；空字符串关闭，启用后只提供 `GET /metrics` |
 
-YAML 支持只写需要覆盖的字段，其他字段保留默认值。未知字段、多个 YAML document、空地址、非正 duration 和非正数值都会导致进程在启动前报错。
+YAML 支持只写需要覆盖的字段，其他字段保留默认值。未知字段、多个 YAML document、必填地址为空、非正 duration 和非正数值都会导致进程在启动前报错。
+
+进程及 Temporal SDK 日志统一以 JSON 写到 stdout，适合由 vlagent、Vector 或容器日志采集器转发到 VictoriaLogs。metrics endpoint 包含 Temporal SDK、Go runtime 和进程指标，供 vmagent 或其他 Prometheus-compatible scraper 拉取。两条链路均不在 Gateway 内配置 Victoria 后端地址或认证信息；metrics endpoint 自身不提供鉴权，应通过监听地址和网络策略限制访问。
 
 ## 安全边界
 

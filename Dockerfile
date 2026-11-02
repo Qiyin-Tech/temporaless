@@ -20,7 +20,7 @@ RUN mkdir -p /etc/temporaless /var/lib/temporaless \
 USER 65532:65532
 WORKDIR /var/lib/temporaless
 VOLUME ["/var/lib/temporaless"]
-EXPOSE 8080
+EXPOSE 8080 9090
 
 ENTRYPOINT ["/usr/local/bin/temporaless"]
 CMD ["-config", "/etc/temporaless/config.yaml"]

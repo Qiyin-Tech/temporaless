@@ -15,11 +15,12 @@ import (
 )
 
 type config struct {
-	Server   serverConfig   `yaml:"server"`
-	Registry registryConfig `yaml:"registry"`
-	Temporal temporalConfig `yaml:"temporal"`
-	Worker   workerConfig   `yaml:"worker"`
-	HTTP     httpConfig     `yaml:"http"`
+	Server        serverConfig        `yaml:"server"`
+	Registry      registryConfig      `yaml:"registry"`
+	Temporal      temporalConfig      `yaml:"temporal"`
+	Worker        workerConfig        `yaml:"worker"`
+	HTTP          httpConfig          `yaml:"http"`
+	Observability observabilityConfig `yaml:"observability"`
 }
 
 type serverConfig struct {
@@ -49,6 +50,14 @@ type workerConfig struct {
 type httpConfig struct {
 	MaxBackendResponseBytes   int64 `yaml:"max_backend_response_bytes"`
 	MaxIdleConnectionsPerHost int   `yaml:"max_idle_connections_per_host"`
+}
+
+type observabilityConfig struct {
+	Metrics metricsConfig `yaml:"metrics"`
+}
+
+type metricsConfig struct {
+	Listen string `yaml:"listen"`
 }
 
 func defaultConfig() config {
@@ -136,6 +145,9 @@ func (c config) validate() error {
 	}
 	if c.HTTP.MaxIdleConnectionsPerHost <= 0 {
 		return errors.New("http.max_idle_connections_per_host must be positive")
+	}
+	if c.Observability.Metrics.Listen != "" && strings.TrimSpace(c.Observability.Metrics.Listen) == "" {
+		return errors.New("observability.metrics.listen must be empty or a listen address")
 	}
 	return nil
 }

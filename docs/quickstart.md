@@ -67,16 +67,23 @@ go run ./cmd/temporaless \
   -config temporaless.example.yaml
 ```
 
-看到下面的日志表示管理 API 已启动：
+看到下面两条 JSON 日志表示管理 API 和可选 metrics server 已启动：
 
-```text
-control API listening address=127.0.0.1:8080
+```json
+{"time":"2026-11-02T10:00:00Z","level":"INFO","msg":"control API listening","service":"temporaless","address":"127.0.0.1:8080"}
+{"time":"2026-11-02T10:00:00Z","level":"INFO","msg":"metrics listening","service":"temporaless","address":"127.0.0.1:9090"}
 ```
 
 REST 契约可以直接查看：
 
 - Swagger UI：<http://127.0.0.1:8080/docs>
 - OpenAPI YAML：<http://127.0.0.1:8080/openapi.yaml>
+
+示例配置还在独立端口开放 Prometheus 指标：
+
+```bash
+curl --fail http://127.0.0.1:9090/metrics
+```
 
 ## 4. 注册 HTTP 服务
 
