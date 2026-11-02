@@ -13,6 +13,7 @@ func FuzzLoadConfigRejectsInvalidOrNormalizesValidYAML(f *testing.F) {
 		"server:\n  unknown: true\n",
 		"server: {}\n---\nworker: {}\n",
 		"worker:\n  max_concurrent_activities_per_service: 9223372036854775807\n",
+		"worker:\n  max_concurrent_activity_task_pollers: -1\n",
 		"server:\n  read_timeout: -9223372036854775808ns\n",
 		"http:\n  max_backend_response_bytes: 0\n",
 		"temporal:\n  startup_timeout: 1h30m\n",
@@ -34,8 +35,8 @@ func FuzzLoadConfigRejectsInvalidOrNormalizesValidYAML(f *testing.F) {
 		if err := configuration.validate(); err != nil {
 			t.Fatalf("loadConfig accepted config that fails validate: %v", err)
 		}
-		if configuration.Worker.MaxConcurrentActivitiesPerService <= 0 || configuration.HTTP.MaxBackendResponseBytes <= 0 {
-			t.Fatalf("accepted invalid limits: worker=%d response=%d", configuration.Worker.MaxConcurrentActivitiesPerService, configuration.HTTP.MaxBackendResponseBytes)
+		if configuration.Worker.MaxConcurrentActivitiesPerService <= 0 || configuration.Worker.MaxConcurrentActivityTaskPollers < 0 || configuration.HTTP.MaxBackendResponseBytes <= 0 {
+			t.Fatalf("accepted invalid limits: activities=%d pollers=%d response=%d", configuration.Worker.MaxConcurrentActivitiesPerService, configuration.Worker.MaxConcurrentActivityTaskPollers, configuration.HTTP.MaxBackendResponseBytes)
 		}
 	})
 }

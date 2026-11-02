@@ -63,7 +63,12 @@ func run() error {
 	}
 	defer temporalClient.Close()
 
-	runtime := control.NewTemporalRuntime(temporalClient, configuration.Worker.StopTimeout, configuration.Worker.MaxConcurrentActivitiesPerService)
+	runtime := control.NewTemporalRuntime(
+		temporalClient,
+		configuration.Worker.StopTimeout,
+		configuration.Worker.MaxConcurrentActivitiesPerService,
+		configuration.Worker.MaxConcurrentActivityTaskPollers,
+	)
 	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
 	httpTransport.MaxIdleConns = max(httpTransport.MaxIdleConns, configuration.HTTP.MaxIdleConnectionsPerHost)
 	httpTransport.MaxIdleConnsPerHost = configuration.HTTP.MaxIdleConnectionsPerHost

@@ -102,7 +102,7 @@ func TestManagerWithTemporal(t *testing.T) {
 		t.Fatalf("open registry: %v", err)
 	}
 	defer store.Close()
-	runtime := NewTemporalRuntime(temporalClient, 5*time.Second, concurrentCalls)
+	runtime := NewTemporalRuntime(temporalClient, 5*time.Second, concurrentCalls, 0)
 	manager := NewManager(store, runtime, backendServer.Client(), ManagerOptions{SwitchTimeout: 15 * time.Second})
 	defer manager.Close()
 

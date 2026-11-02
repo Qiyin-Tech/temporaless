@@ -205,6 +205,7 @@ TEMPORALESS_STRESS=1 go test -run '^TestSustainedControlPlaneStress$' -timeout 1
 - [Quick Start](docs/quickstart.md)：从本地环境到真实 Workflow 调用。
 - [REST 与 Temporal API](docs/api.md)：配置 schema、管理 API、Activity contract、错误和参数。
 - [ADR-0001](docs/adr/0001-hot-reloadable-http-activity-workers.md)：版本路由、失败恢复、取消和 tombstone 的设计依据。
+- [2026-11-02 远端负载测试](docs/benchmarks/2026-11-02-temporaless-load-test.md)：真实 Temporal 调度下的 TPS、CPU 和内存基线及适用边界。
 
 ## Limitations
 

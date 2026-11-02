@@ -21,10 +21,11 @@ type TemporalRuntime struct {
 	client                  client.Client
 	stopTimeout             time.Duration
 	maxConcurrentActivities int
+	maxActivityTaskPollers  int
 }
 
 // NewTemporalRuntime creates an Activity-only Worker runtime sharing one Temporal client.
-func NewTemporalRuntime(temporalClient client.Client, stopTimeout time.Duration, maxConcurrentActivities int) *TemporalRuntime {
+func NewTemporalRuntime(temporalClient client.Client, stopTimeout time.Duration, maxConcurrentActivities, maxActivityTaskPollers int) *TemporalRuntime {
 	if stopTimeout <= 0 {
 		stopTimeout = 30 * time.Second
 	}
@@ -35,6 +36,7 @@ func NewTemporalRuntime(temporalClient client.Client, stopTimeout time.Duration,
 		client:                  temporalClient,
 		stopTimeout:             stopTimeout,
 		maxConcurrentActivities: maxConcurrentActivities,
+		maxActivityTaskPollers:  maxActivityTaskPollers,
 	}
 }
 
@@ -44,6 +46,7 @@ func (r *TemporalRuntime) Start(serviceID string, buildID string, activityFn Act
 		DisableWorkflowWorker:              true,
 		WorkerStopTimeout:                  r.stopTimeout,
 		MaxConcurrentActivityExecutionSize: r.maxConcurrentActivities,
+		MaxConcurrentActivityTaskPollers:   r.maxActivityTaskPollers,
 		DeploymentOptions: worker.DeploymentOptions{
 			UseVersioning: true,
 			Version: worker.WorkerDeploymentVersion{
