@@ -417,6 +417,7 @@ worker:
   switch_timeout: 30s
   stop_timeout: 30s
   max_concurrent_activities_per_service: 32
+  max_concurrent_activity_task_pollers: 0
 
 http:
   max_backend_response_bytes: 1048576
@@ -443,6 +444,7 @@ observability:
 | `worker.switch_timeout` | `30s` | 单次 revision Current Version 切换 deadline |
 | `worker.stop_timeout` | `30s` | 旧 Worker 排空 in-flight Activity 的宽限时间 |
 | `worker.max_concurrent_activities_per_service` | `32` | 每个服务 Worker 的 Activity 并发上限 |
+| `worker.max_concurrent_activity_task_pollers` | `0` | 每个服务 Worker 的 Activity task poller 数；`0` 交给 Temporal SDK 默认值或服务端启用的 poller autoscaling，正数使用固定 poller 数 |
 | `http.max_backend_response_bytes` | `1048576` | 读入内存并返回 Temporal 的最大后端响应体 bytes |
 | `http.max_idle_connections_per_host` | `32` | 共享 HTTP Transport 每个 host 保留的最大空闲连接数 |
 | `observability.metrics.listen` | `""` | 独立 Prometheus server 的监听地址；空字符串关闭，启用后只提供 `GET /metrics` |

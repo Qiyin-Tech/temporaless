@@ -29,6 +29,7 @@ temporal:
 
 worker:
   max_concurrent_activities_per_service: 32
+  max_concurrent_activity_task_pollers: 0
 
 http:
   max_backend_response_bytes: 1048576
@@ -96,11 +97,36 @@ target_tps,offered,steady_completed,steady_tps,total_completed,errors,p50_ms,p95
 
 这说明高目标速率下，Activity 没有被足够快地投递给 temporaless。当前数据只能确定同机 Temporal dev、Workflow Worker 和 workflow-per-request 负载模型组成的链路在约 50 TPS 后开始排队，不能据此确定 temporaless Worker 自身的最大 TPS。
 
+## Activity-only 与 PostgreSQL 复测
+
+为排除 workflow-per-request 的额外成本，又使用长生命周期 Workflow 循环执行 `ExecuteActivity`，并将 Temporal Server 1.32.0 按官方 schema 部署到 PostgreSQL 16。每档使用 64 个并发 Workflow，持续 20 秒；HTTP 后端仍立即返回 `204 No Content`。temporaless 的 Activity 并发上限保持 32。
+
+第一组仅调整每个服务 Worker 的 Activity task poller 数，Temporal 保持默认的 4 个 History shards：
+
+| Activity task pollers | 窗口内实际执行次数 | invoke TPS | 实际执行次数（含排空） | Workflow errors | temporaless CPU 平均 / 峰值 | RSS 峰值 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2（SDK 默认） | 1318 | 65.90 | 1375 | 0 | 12.45% / 24.31% | 49.08 MiB |
+| 16 | 1499 | 74.95 | 1543 | 0 | 13.62% / 24.78% | 48.61 MiB |
+
+将 `worker.max_concurrent_activity_task_pollers` 从 SDK 默认的 2 调到 16 后，invoke TPS 提高 `13.7%`。16 pollers 档中 Activity execution 平均约 `0.70 ms`，但 Schedule-to-Start 平均约 `224 ms`，说明 HTTP 执行本身不是主耗时。
+
+第二组保持 16 pollers，并使用全新的 PostgreSQL 数据卷对比 History shard 数：
+
+| History shards | 窗口内实际执行次数 | invoke TPS | 实际执行次数（含排空） | PostgreSQL `xact_commit` 增量 | Workflow errors | temporaless CPU 平均 / 峰值 | Temporal CPU 平均 / 峰值 | PostgreSQL CPU 平均 / 峰值 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 1499 | 74.95 | 1543 | 40,238 | 0 | 13.62% / 24.78% | 81.46% / 136.27% | 45.47% / 69.67% |
+| 32 | 3079 | 153.95 | 3117 | 84,263 | 0 | 21.01% / 31.96% | 119.01% / 211.89% | 72.75% / 129.58% |
+
+32 shards 相比 4 shards 提高 `105.4%`，temporaless 仍只使用约 `0.21 core`，RSS 峰值为 `48.39 MiB`。32-shard 档中 PostgreSQL 的 `xact_commit` 增加 84,263，数据盘平均利用率 `59.7%`、峰值 `92.1%`，平均写入约 `5.33 MiB/s`。因此当前 4 vCPU 单机环境的下一层限制在 Temporal History 持久化、PostgreSQL 和磁盘，而不是 temporaless 的 HTTP Activity 执行。
+
+History shard 数是 Temporal 集群创建时确定的静态配置，不能在已有集群上修改，生产部署应在建库前按预期吞吐规划并压测，不能把本次单机结果直接作为推荐值。参见 [Temporal Service configuration reference](https://docs.temporal.io/references/service-configuration)。`max_concurrent_activity_task_pollers` 则是每个服务 Worker 的配置；服务数量增加时，总 poller 数也会线性增加。
+
 ## 使用这些数据
 
-- 可把 `50 TPS / 0.103 core / 48.60 MiB RSS` 作为当前版本在该测试条件下的已验证基线。
+- 可把 `50 TPS / 0.103 core / 48.60 MiB RSS` 作为第一组 workflow-per-request 测试条件下的已验证基线。
 - 不应把 50 TPS 写成生产容量上限，也不应按上述两个稳定档位直接线性外推。
 - 若要测 temporaless 的饱和点，应使用独立 Temporal 集群和足以持续填满 Activity Task Queue 的负载生成方式，并分别观测 Temporal backlog 与 temporaless Activity slot 使用率。
+- PostgreSQL 部署下应同时观测 History shard、事务量、数据库 CPU 和数据盘 fsync；只提高 temporaless poller 数不能消除服务端瓶颈。
 - 生产 sizing 还需要覆盖真实后端延迟、不同 payload 大小、多服务竞争和持续运行时的内存稳定性。
 
 本次负载生成器是临时测试工具，没有提交到仓库。报告保留了复测所需的负载语义和配置，但目前不能通过仓库中的单条命令复现。

@@ -45,6 +45,7 @@ type workerConfig struct {
 	SwitchTimeout                     time.Duration `yaml:"switch_timeout"`
 	StopTimeout                       time.Duration `yaml:"stop_timeout"`
 	MaxConcurrentActivitiesPerService int           `yaml:"max_concurrent_activities_per_service"`
+	MaxConcurrentActivityTaskPollers  int           `yaml:"max_concurrent_activity_task_pollers"`
 }
 
 type httpConfig struct {
@@ -79,6 +80,7 @@ func defaultConfig() config {
 			SwitchTimeout:                     30 * time.Second,
 			StopTimeout:                       30 * time.Second,
 			MaxConcurrentActivitiesPerService: 32,
+			MaxConcurrentActivityTaskPollers:  0,
 		},
 		HTTP: httpConfig{
 			MaxBackendResponseBytes:   backend.DefaultMaxResponseBodyBytes,
@@ -139,6 +141,9 @@ func (c config) validate() error {
 	}
 	if c.Worker.MaxConcurrentActivitiesPerService <= 0 {
 		return errors.New("worker.max_concurrent_activities_per_service must be positive")
+	}
+	if c.Worker.MaxConcurrentActivityTaskPollers < 0 {
+		return errors.New("worker.max_concurrent_activity_task_pollers must not be negative")
 	}
 	if c.HTTP.MaxBackendResponseBytes <= 0 {
 		return errors.New("http.max_backend_response_bytes must be positive")
